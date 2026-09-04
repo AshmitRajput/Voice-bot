@@ -1,6 +1,7 @@
 """
 Recovery Service — the central orchestrator. This is the ONE entry point for processing customer turns. Per plan: the
-voice consumer (consumers.py) calls this, not cloud_llm_service directly. """
+voice consumer (consumers.py) calls this, not cloud_llm_service directly.
+"""
 
 import json
 import logging
@@ -11,7 +12,7 @@ logger = logging.getLogger('recovery_agent')
 
 
 # Recovery agent system prompt
-RECOVERY_SYSTEM_PROMPT = """You are Aarohi, a warm and professional Hindi/Hinglish-speaking revenue-recovery agent. Your job is to recover overdue payments on behalf of the dealer, while keeping the customer comfortable and the conversation respectful.
+RECOVERY_SYSTEM_PROMPT = """You are Aarohi, a warm and professional Hindi/Hinglish-speaking revenue-recovery agent. Your job is to recover overdue payments on behalf of the business, while keeping the customer comfortable and the conversation respectful.
 
 CORE RULES:
 1. SPEAK NATURALLY IN HINDI/HINGLISH. Match the customer's language register.
@@ -22,12 +23,12 @@ CORE RULES:
 6. Always use the customer's name once you know it.
 
 RECOVERY FLOW:
-- Open: greet, confirm identity, state purpose, ask about outstanding balance.
-- If customer wants to pay now: send_payment_link, confirm receipt, end_call.
-- If customer already paid: verify_payment, end_call.
-- If customer will pay later: record_payment_promise, end_call.
+- Open: greet, confirm identity, state purpose, mention the outstanding amount and due date.
+- If customer wants to pay now: create_payment_link, confirm receipt, end_call.
+- If customer already paid: get_recovery_context to check verified status, end_call.
+- If customer will pay later: update_recovery_case with promise_to_pay, end_call.
 - If customer wants callback: schedule_callback, end_call.
-- If customer refuses: acknowledge, ask reason, end_call.
+- If customer refuses: acknowledge, ask reason, update_recovery_case, end_call.
 - If customer disputes: pause, mark as dispute, end_call.
 - If customer has complaint: acknowledge, mark as complaint, end_call.
 
@@ -38,14 +39,14 @@ When you need to use a tool, your ENTIRE reply is ONLY the tool JSON (no other t
 When you want to speak to the customer, write plain Hindi/Hinglish text (no JSON).
 When you want to end the call, call the end_call tool with the right reason.
 
-{today} ki baat ho rahi hai. Customer: {customer_name}. Vehicle: {vehicle_model}.
+{today} ki baat ho rahi hai. Customer: {customer_name}. Outstanding amount: {amount_due} {currency}. Due date: {due_date}.
 """
 
 
 class RecoveryService:
     def __init__(self):
         # Lazy init the classifier
-        from recovery_agent.services.intent_service import recovery_intent_service
+        from recovery_agent.services.recovery_intent_service import recovery_intent_service
         self.classifier = recovery_intent_service
         self.gemini_key = os.environ.get("GOOGLE_API_KEY", "")
         # Auto-register tools on first use
@@ -57,7 +58,6 @@ class RecoveryService:
         session_id: str,
         customer_text: str,
         customer_id: Optional[int] = None,
-        dealer_id: Optional[int] = None,
         history: Optional[list] = None,
     ) -> dict:
         """
@@ -75,11 +75,10 @@ class RecoveryService:
         history = history or []
         from recovery_agent.services.conversation_history import (
             get_state, set_recovery_intent, set_final_transcript, save_conversation,
-            get_recovery_status, set_recovery_status,
         )
-        from recovery_agent.tools import (
-            tool_registry, set_tool_session, reset_tool_session,
-            parse_tool_call, execute_tool, get_call_context,
+        from recovery_agent.tools.tool_registry import (
+            set_tool_session, reset_tool_session, parse_tool_call, execute_tool,
+            get_tool_prompt_block,
         )
 
         # 1. Update state with new transcript
@@ -106,21 +105,13 @@ class RecoveryService:
 
         # 5. Tool-hop loop.
         #
-        # Previously this loop only re-parsed response_text for another
-        # tool-call JSON blob after each tool executed, and only updated
-        # response_text when the tool's result happened to include a
-        # "message" key. That worked by coincidence for create_payment_link,
-        # schedule_callback, and end_call (which all return "message"), but
-        # left the raw {"tool": ...} JSON as the customer-facing reply for
-        # get_recovery_context and update_recovery_case, which don't.
-        #
-        # Fixed: after a non-terminal tool executes, append the tool call
-        # and its result to the message history and call the LLM again for
-        # a natural-language reply (standard function-calling pattern).
+        # After a non-terminal tool executes, we append the tool call and
+        # its result to the message history and call the LLM again for a
+        # natural-language reply (standard function-calling pattern).
         # Terminal tools (end_call, schedule_callback -- anything with
-        # ToolSpec.terminal=True) still end the turn immediately using
-        # their own "message", since no further LLM turn should happen
-        # after the call is ending.
+        # ToolSpec.terminal=True) end the turn immediately using their own
+        # "message", since no further LLM turn should happen after the
+        # call is ending.
         tool_calls_made = []
         should_end = False
         max_hops = 4
@@ -132,7 +123,6 @@ class RecoveryService:
                 if not tool_call:
                     break
                 name, args = tool_call
-                # Inject customer_id if missing
                 if customer_id and "customer_id" not in args:
                     args["customer_id"] = customer_id
                 logger.info(f"[RECOVERY] executing tool: {name}({args})")
@@ -150,9 +140,6 @@ class RecoveryService:
                     )
                     break
 
-                # Non-terminal tool: feed the tool result back to the LLM
-                # as context and ask it to respond naturally (or call
-                # another tool if it still needs to).
                 messages.append({
                     "role": "assistant",
                     "content": json.dumps(
@@ -221,24 +208,36 @@ class RecoveryService:
         from zoneinfo import ZoneInfo
         IST = ZoneInfo("Asia/Kolkata")
         now = datetime.now(IST).strftime("%Y-%m-%d %H:%M %Z")
-        customer_name = (customer_context or {}).get("customer_name", "Customer")
-        vehicle_model = "Unknown"
-        if customer_context and customer_context.get("vehicles"):
-            vehicle_model = customer_context["vehicles"][0].get("model", "Unknown")
-        # Get available tools as a prompt block
-        from recovery_agent.tools import get_tool_prompt_block
+
+        customer_name = "Customer"
+        amount_due = "0"
+        currency = "INR"
+        due_date = "unknown"
+
+        if customer_context:
+            customer_name = customer_context.get("customer_name", "Customer")
+            case = customer_context.get("open_case")
+            if case:
+                amount_due = case.get("amount_due", "0")
+                currency = case.get("currency", "INR")
+                due_date = case.get("due_date") or "unknown"
+
+        from recovery_agent.tools.tool_registry import get_tool_prompt_block
         tool_block = get_tool_prompt_block()
         system_prompt = RECOVERY_SYSTEM_PROMPT.format(
             today=now,
             customer_name=customer_name,
-            vehicle_model=vehicle_model,
+            amount_due=amount_due,
+            currency=currency,
+            due_date=due_date,
         ) + "\n\n" + tool_block
-        # Build messages
+
         messages = [{"role": "system", "content": system_prompt}]
         for turn in history[-6:]:
-            role = "user" if turn.get("role") == "customer" else "assistant"
+            role = turn.get("role")
             if not role:
                 role = "user" if turn.get("speaker", "").lower() == "customer" else "assistant"
+            role = "user" if role == "customer" else role
             messages.append({"role": role, "content": turn.get("text", "")})
         messages.append({"role": "user", "content": customer_text})
         return messages
@@ -246,7 +245,6 @@ class RecoveryService:
     def _call_gemini(self, messages):
         """Call Gemini's OpenAI-compatible endpoint via the chat.completions format."""
         import requests
-        # Convert messages to Gemini format
         contents = []
         system_text = ""
         for m in messages:
@@ -256,7 +254,6 @@ class RecoveryService:
                 contents.append({"role": "user", "parts": [{"text": m["content"]}]})
             elif m["role"] == "assistant":
                 contents.append({"role": "model", "parts": [{"text": m["content"]}]})
-        # Prepend system text to first user message
         if system_text and contents:
             contents[0]["parts"][0]["text"] = system_text + "\n\n" + contents[0]["parts"][0]["text"]
         url = (

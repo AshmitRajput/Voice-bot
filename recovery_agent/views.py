@@ -1,5 +1,6 @@
 """
-Views — minimal set for local curl testing. """
+Views — minimal set for local curl testing.
+"""
 
 import json
 import logging
@@ -7,7 +8,6 @@ import logging
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from django.conf import settings
 from django.utils import timezone
 
 logger = logging.getLogger('recovery_agent')
@@ -90,7 +90,9 @@ def test_classify_intent(request):
         body = json.loads(request.body or "{}")
         customer_text = body.get("customer_text", "")
         history = body.get("history", [])
-        from recovery_agent.services.intent_service import recovery_intent_service
+        # NOTE: the module is recovery_intent_service.py, not intent_service.py
+        # (the old import path here was wrong and would ImportError).
+        from recovery_agent.services.recovery_intent_service import recovery_intent_service
         result = recovery_intent_service.detect_intent(customer_text, history=history)
         return JsonResponse({"success": True, **result})
     except Exception as e:
@@ -118,7 +120,9 @@ def test_tool_call(request):
         arguments = body.get("arguments", {})
         if not tool_name:
             return JsonResponse({"success": False, "error": "tool name required"}, status=400)
-        from recovery_agent.tools import execute_tool, set_tool_session, reset_tool_session
+        from recovery_agent.tools.tool_registry import (
+            execute_tool, set_tool_session, reset_tool_session,
+        )
         from recovery_agent.tools.recovery_tools import register_all_recovery_tools
         register_all_recovery_tools()
         session_id = arguments.get("session_id", f"test-{timezone.now().timestamp()}")
@@ -141,7 +145,7 @@ def test_tool_call(request):
 def test_list_tools(request):
     """GET /api/test/list-tools/"""
     try:
-        from recovery_agent.tools import get_tool_declarations
+        from recovery_agent.tools.tool_registry import get_tool_declarations
         from recovery_agent.tools.recovery_tools import register_all_recovery_tools
         register_all_recovery_tools()
         tools = get_tool_declarations()
@@ -204,31 +208,43 @@ def test_clear_session(request):
 
 
 # ═══════════════════════════════════════════════════════════════
-# LEGACY: stub for consumers.py / views_admin.py imports
-# (so old imports don't break the server)
+# Helpers used by consumers.py / views_admin.py
+# Rewritten against the real 13-model schema: no dealer_id, no vehicle,
+# no branch, no module. CallSession/ConversationTurn have no `dealer`
+# field at all, so the old versions of get_or_create_call_session() and
+# save_turn() below would have raised on first use.
 # ═══════════════════════════════════════════════════════════════
 
-def get_or_create_call_session(session_id, phone_number=None, **kwargs):
-    """Legacy stub — full impl can come later."""
+def get_or_create_call_session(session_id, phone_number=None, customer_id=None, **kwargs):
+    """Get or create a CallSession for this session_id."""
     from recovery_agent.models import CallSession, Customer
-    customer = Customer.objects.filter(phone_number=phone_number, flag="c").first() if phone_number else None
+
+    customer = None
+    if customer_id:
+        customer = Customer.objects.filter(id=customer_id, flag="c").first()
+    elif phone_number:
+        customer = Customer.objects.filter(phone_number=phone_number, flag="c").first()
+
     obj, _ = CallSession.objects.get_or_create(
         session_id=session_id,
-        defaults={"customer": customer, "dealer_id": customer.dealer_id if customer else None},
+        defaults={"customer": customer},
     )
     return obj
 
 
 def get_customer_context(phone_number):
-    """Legacy stub — returns a context dict similar to the old format."""
+    """Returns the LLM-facing recovery context dict for a phone number."""
     from recovery_agent.services.crm_service import crm_service
     profile = crm_service.get_customer_by_phone(phone_number) or {}
+    case = profile.get("open_case") or {}
     return {
+        "customer_id": profile.get("customer_id"),
         "customer_name": profile.get("customer_name", "Customer"),
-        "vehicle_model": (profile.get("vehicles") or [{}])[0].get("model", "Unknown") if profile.get("vehicles") else "Unknown",
-        "due_date": (profile.get("vehicles") or [{}])[0].get("next_service_due_date") if profile.get("vehicles") else "Unknown",
-        "module": "service_recovery",
-        "branch": profile.get("branch_name", "Unknown"),
+        "phone_number": profile.get("phone_number", phone_number),
+        "amount_due": case.get("amount_due", "0"),
+        "due_date": case.get("due_date"),
+        "recovery_status": case.get("status", "no_open_case"),
+        "workflow": "revenue_recovery",
     }
 
 
@@ -242,10 +258,10 @@ def get_random_customer_context():
     if not c:
         return {
             "customer_name": "Customer",
-            "vehicle_model": "Unknown",
-            "due_date": "Unknown",
-            "module": "service_recovery",
-            "branch": "Unknown",
+            "amount_due": "0",
+            "due_date": None,
+            "recovery_status": "no_open_case",
+            "workflow": "revenue_recovery",
             "customer_id": None,
             "phone_number": None,
         }
@@ -256,26 +272,25 @@ def get_random_customer_context():
 
 
 def save_turn(session_id, speaker, text, **kwargs):
-    """Legacy stub — saves a ConversationTurn row."""
+    """Saves a ConversationTurn row."""
     from recovery_agent.models import ConversationTurn, CallSession
     sess = CallSession.objects.filter(session_id=session_id).first()
     if not sess:
         return None
     return ConversationTurn.objects.create(
         call_session=sess,
-        dealer=sess.dealer,
         speaker=speaker,
         text=text,
         **{k: v for k, v in kwargs.items() if k in [
-            "intent", "confidence", "filler_text", "accuracy", "filler_accuracy",
-            "llm_pricing", "stt_pricing", "tts_pricing", "timing",
+            "intent", "confidence", "entities", "filler_text", "accuracy",
+            "filler_accuracy", "llm_accuracy", "llm_pricing", "stt_pricing",
+            "tts_pricing", "timing",
         ]},
     )
 
 
 def end_call_session(session_id, status="completed"):
     from recovery_agent.models import CallSession
-    from django.utils import timezone
     sess = CallSession.objects.filter(session_id=session_id).first()
     if not sess:
         return None
@@ -288,7 +303,6 @@ def end_call_session(session_id, status="completed"):
 
 
 def finalize_call_summary(session_id, context, **kwargs):
-    """Legacy stub — generates a basic summary."""
     from recovery_agent.models import CallSession
     sess = CallSession.objects.filter(session_id=session_id).first()
     if not sess:
@@ -326,7 +340,12 @@ def log_service_error(**kwargs):
         return None
 
 
-# Stubs for old Honda booking functions (consumers.py imports these)
+# ═══════════════════════════════════════════════════════════════
+# Stubs for old Honda booking functions — consumers.py still imports
+# these names; once consumers.py is rewritten these can be deleted
+# entirely along with the import.
+# ═══════════════════════════════════════════════════════════════
+
 def extract_slot_request(text, **kwargs):
     return None, None, False
 

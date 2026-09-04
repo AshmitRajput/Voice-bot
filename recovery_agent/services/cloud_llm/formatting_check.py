@@ -2,28 +2,29 @@
 Validates that response_text follows the mixed-script rule -- Devanagari
 Hindi by default, with a fixed set of terms kept in Latin script.
 
+Rewritten vs previous version: ALLOWED_PROPER_NOUNS was the full Honda
+vehicle lineup (Activa, Shine, Dio, Unicorn, SP125, Livo, Grazia,
+Hornet, CB350) plus "aarohi" hardcoded. None of that applies to a
+revenue-recovery agent. Replaced with recovery-domain terms; persona
+name is now pulled from context (falls back to "riya") instead of
+hardcoded, so it stays correct if the admin renames the persona.
 """
 
 import json
 import re
 
 # Loanwords the persona keeps in Latin script even inside Devanagari text.
-# Must stay in sync with PERSONA_SYSTEM_INSTRUCTION.
 ALLOWED_LATIN_TERMS = {
-    "emi", "service", "booking", "book", "test drive", "showroom",
-    "appointment", "call", "ok", "due", "finance", "team",
-    "customer", "manager", "warranty", "insurance",
+    "emi", "upi", "payment", "link", "sms", "whatsapp", "email",
+    "ok", "due", "call", "team", "customer", "manager", "account",
+    "case", "id", "otp",
 }
 
-# Proper nouns that are always Latin: brand, showroom, assistant, models.
+# Proper nouns that are always Latin. Persona name is added dynamically
+# per-call via _build_allowed (context["persona_name"]); this is only the
+# static fallback in case context doesn't carry one.
 ALLOWED_PROPER_NOUNS = {
-    "om honda", "honda", "aarohi",
-    "honda activa", "activa", "honda activa 6g", "activa 6g",
-    "honda shine", "shine", "honda dio", "dio",
-    "honda unicorn", "unicorn", "honda sp125", "sp125",
-    "honda livo", "livo", "honda grazia", "grazia",
-    "honda hornet 2.0", "hornet 2.0", "hornet",
-    "honda cb350", "cb350",
+    "riya",
 }
 
 DEVANAGARI_RANGE = re.compile(r"[\u0900-\u097F]")
@@ -52,10 +53,10 @@ def extract_response_text(payload):
 def _build_allowed(context=None):
     allowed = set(ALLOWED_LATIN_TERMS) | set(ALLOWED_PROPER_NOUNS)
     if context:
-        # Per-call values. The customer's name varies every call, so it can
-        # never be a static allowlist entry -- without this the checker flags
-        # every correctly-personalised response.
-        for key in ("customer_name", "vehicle_model", "vehicle", "showroom_name"):
+        # Per-call values. The customer's name and persona name vary, so
+        # they can never be static allowlist entries -- without this the
+        # checker flags every correctly-personalised response.
+        for key in ("customer_name", "persona_name"):
             value = context.get(key)
             if value:
                 allowed.add(str(value).lower())
@@ -67,15 +68,13 @@ def _build_allowed(context=None):
 def check_response(payload, context=None) -> dict:
     """
     Returns a dict describing whether the spoken line follows the
-    mixed-script rule. `context` is the same CRM dict passed to
-    build_turn_input, used to whitelist per-call proper nouns.
+    mixed-script rule. `context` is the same recovery-call context dict
+    passed to build_turn_input, used to whitelist per-call proper nouns.
     """
     response_text = extract_response_text(payload)
 
     has_devanagari = bool(DEVANAGARI_RANGE.search(response_text))
 
-    # Strip allowed phrases longest-first so "test drive" is consumed before
-    # "test", and "honda activa" before "honda".
     remaining = response_text
     for phrase in sorted(_build_allowed(context), key=len, reverse=True):
         remaining = re.sub(rf"\b{re.escape(phrase)}\b", " ", remaining,
@@ -94,8 +93,8 @@ def check_response(payload, context=None) -> dict:
 def check_batch(payloads: list, contexts: list = None) -> dict:
     """
     payloads: list of response_text strings (or raw payloads).
-    contexts: optional matching list of CRM context dicts, so per-call names
-              are whitelisted correctly.
+    contexts: optional matching list of call context dicts, so per-call
+              names are whitelisted correctly.
     """
     contexts = contexts or [None] * len(payloads)
     results = [check_response(p, c) for p, c in zip(payloads, contexts)]

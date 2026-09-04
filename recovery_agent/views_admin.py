@@ -1,18 +1,22 @@
 """
 Admin / dashboard control APIs for RecoverAI. Handles:
 - AI persona (LLM setting)
-- Voice config
-- LLM configuration
-- Dealer / branch config
-- Recovery campaigns
-- Call recordings
-- Call history
+- Voice config (TTS voices)
+- Recovery campaigns / cases / callbacks
+- Call recordings / call history
 - Customers
-- Recovery dashboard
-- Analytics
+- Recovery dashboard / analytics
 - Barge-in settings
 
-NO booking, NO test pages, NO LLM playground, NO debug endpoints. """
+Rewritten against the real 13-model schema. No Dealer / Branch / Segment /
+Vehicle anywhere — those models don't exist. LLMSetting is a flat row
+(no `segment` FK) selected by `is_active`, not by segment name.
+
+Also defines the two sync helpers consumers.py imports and calls but that
+did not exist anywhere in the previous version of this file:
+    _resolve_customer_sync   (replaces the old _resolve_dealer_branch_sync)
+    _persist_recording_paths_sync
+"""
 import json
 import logging
 import os
@@ -28,11 +32,10 @@ from rest_framework.pagination import PageNumberPagination
 from django.conf import settings
 from django.db.models import Count, Q, Sum, Avg
 from django.utils import timezone
-from decimal import Decimal
 
 from .models import (
-    Dealer, Branch, Customer, CallSession, TTSVoice, Segment, LLMSetting,
-    Vehicle, RecoveryCase, Callback, PaymentRecord,
+    Customer, CallSession, TTSVoice, LLMSetting,
+    RecoveryCase, RecoveryCampaign, Callback, PaymentRecord,
 )
 
 logger = logging.getLogger('voice_bot')
@@ -54,24 +57,13 @@ def _serialize_tts_voice(voice):
         "id": voice.id,
         "voice_name": voice.voice_name,
         "gender": voice.gender,
-        "provider_id": voice.provider_id,
+        "provider_voice_id": voice.provider_voice_id,
         "provider_name": voice.provider_name,
+        "language": voice.language,
         "is_active": voice.is_active,
+        "sample_url": voice.sample_url,
         "created_at": voice.created_at.isoformat() if voice.created_at else None,
         "updated_at": voice.updated_at.isoformat() if voice.updated_at else None,
-    }
-
-
-def _serialize_segment(segment):
-    if segment is None:
-        return None
-    return {
-        "id": segment.id,
-        "name": segment.name,
-        "description": segment.description,
-        "module": getattr(segment, 'module', None),
-        "created_at": segment.created_at.isoformat() if segment.created_at else None,
-        "updated_at": segment.updated_at.isoformat() if segment.updated_at else None,
     }
 
 
@@ -80,11 +72,13 @@ def _serialize_llm_setting(setting):
         return None
     return {
         "id": setting.id,
-        "dealer_id": setting.dealer_id,
-        "module": setting.module,
-        "segment": _serialize_segment(setting.segment),
+        "name": setting.name,
+        "is_active": setting.is_active,
+        "provider": setting.provider,
+        "model": setting.model,
+        "temperature": setting.temperature,
+        "max_tokens": setting.max_tokens,
         "persona_name": setting.persona_name,
-        "agent_name": getattr(setting, 'agent_name', None),
         "opening_line": setting.opening_line,
         "system_prompt": setting.system_prompt,
         "behaviour": setting.behaviour,
@@ -94,6 +88,9 @@ def _serialize_llm_setting(setting):
         "barge_in_threshold": setting.barge_in_threshold,
         "max_turns": setting.max_turns,
         "allow_customer_barge_in": setting.allow_customer_barge_in,
+        "language": setting.language,
+        "response_max_chars": setting.response_max_chars,
+        "questions_per_turn_max": setting.questions_per_turn_max,
         "created_at": setting.created_at.isoformat() if setting.created_at else None,
         "updated_at": setting.updated_at.isoformat() if setting.updated_at else None,
     }
@@ -109,38 +106,26 @@ def _serialize_customer_brief(customer):
     }
 
 
-def _serialize_vehicle_brief(vehicle):
-    if vehicle is None:
-        return None
-    return {
-        "id": vehicle.id,
-        "vehicle_name": vehicle.vehicle_name,
-        "vehicle_model": vehicle.vehicle_model,
-        "registration_no": vehicle.registration_no,
-    }
-
-
 def _serialize_recording(session):
     """Serializes a CallSession row as a 'recording' for the frontend."""
     return {
         "id": session.id,
         "session_id": str(session.session_id),
         "customer": _serialize_customer_brief(session.customer),
-        "vehicle": _serialize_vehicle_brief(getattr(session, 'vehicle', None)),
-        "segment": _serialize_segment(getattr(session, 'segment', None)),
-        "agent": _serialize_llm_setting_brief(getattr(session, 'agent', None)),
+        "campaign_id": session.campaign_id,
+        "agent": _serialize_llm_setting_brief(session.agent),
         "status": session.status,
-        "intent": getattr(session, 'intent', None),
-        "recovery_outcome": getattr(session, 'recovery_outcome', None),
-        "direction": getattr(session, 'direction', 'outbound'),
+        "intent": session.intent,
+        "recovery_outcome": session.recovery_outcome,
+        "direction": session.direction,
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "ended_at": session.ended_at.isoformat() if session.ended_at else None,
         "duration_seconds": session.duration_seconds,
         "transcript": session.transcript,
-        "intent_history": getattr(session, 'intent_history', []),
-        "call_summary": getattr(session, 'call_summary', None),
-        "recording_stereo": getattr(session, 'recording_stereo', None),
-        "recording_mixed": getattr(session, 'recording_mixed', None),
+        "intent_history": session.intent_history,
+        "call_summary": session.call_summary,
+        "recording_stereo": session.recording_stereo,
+        "recording_mixed": session.recording_mixed,
     }
 
 
@@ -150,8 +135,7 @@ def _serialize_llm_setting_brief(setting):
     return {
         "id": setting.id,
         "persona_name": setting.persona_name,
-        "agent_name": getattr(setting, 'agent_name', None),
-        "module": getattr(setting, 'module', None),
+        "name": setting.name,
     }
 
 
@@ -159,10 +143,11 @@ def _serialize_callback(cb):
     return {
         "id": cb.id,
         "customer_id": cb.customer_id,
+        "recovery_case_id": cb.recovery_case_id,
         "scheduled_for": cb.scheduled_for.isoformat() if cb.scheduled_for else None,
         "reason": cb.reason,
         "status": cb.status,
-        "session_id": str(cb.session_id) if cb.session_id else None,
+        "session_id": cb.session.session_id if cb.session_id else None,
         "created_at": cb.created_at.isoformat() if cb.created_at else None,
     }
 
@@ -173,42 +158,17 @@ def _serialize_recovery_case(case):
         "customer_id": case.customer_id,
         "campaign_id": case.campaign_id,
         "status": case.status,
-        "outcome": getattr(case, 'outcome', None),
-        "amount_due": str(case.amount_due) if getattr(case, 'amount_due', None) else None,
-        "amount_recovered": str(case.amount_recovered) if getattr(case, 'amount_recovered', None) else None,
+        "priority": case.priority,
+        "outcome": case.outcome,
+        "current_intent": case.current_intent,
+        "current_outcome": case.current_outcome,
+        "amount_due": str(case.amount_due),
+        "amount_recovered": str(case.amount_recovered),
+        "due_date": case.due_date.isoformat() if case.due_date else None,
+        "promise_date": case.promise_date.isoformat() if case.promise_date else None,
         "created_at": case.created_at.isoformat() if case.created_at else None,
-        "closed_at": case.closed_at.isoformat() if getattr(case, 'closed_at', None) else None,
+        "closed_at": case.closed_at.isoformat() if case.closed_at else None,
     }
-
-
-# ═══════════════════════════════════════════════════════════════
-# DEALERS / BRANCHES
-# ═══════════════════════════════════════════════════════════════
-
-@api_view(['GET'])
-def dealers_list(request):
-    """GET /api/admin/dealers/"""
-    ds = Dealer.objects.filter(flag='c', is_active=True).order_by('name')
-    return Response({
-        "success": True,
-        "dealers": [
-            {"id": d.id, "name": d.name, "code": getattr(d, 'code', '')}
-            for d in ds
-        ],
-    })
-
-
-@api_view(['GET'])
-def dealer_branches(request):
-    """GET /api/admin/branches/?dealer_id=1"""
-    dealer_id = request.GET.get('dealer_id')
-    if not dealer_id:
-        return Response({"success": False, "error": "dealer_id is required"}, status=400)
-    branches = Branch.objects.filter(dealer_id=dealer_id, flag='c', is_active=True).order_by('name')
-    return Response({
-        "success": True,
-        "branches": [{"id": b.id, "name": b.name} for b in branches],
-    })
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -222,7 +182,7 @@ def tts_voices(request):
     POST /api/admin/tts-voices/
     """
     if request.method == "GET":
-        voices = TTSVoice.objects.all().order_by("voice_name")
+        voices = TTSVoice.objects.filter(flag='c').order_by("voice_name")
         return Response({
             "success": True,
             "count": voices.count(),
@@ -237,9 +197,11 @@ def tts_voices(request):
     voice = TTSVoice.objects.create(
         voice_name=data["voice_name"],
         gender=data["gender"],
-        provider_id=data.get("provider_id", 1),
+        provider_voice_id=data.get("provider_voice_id", ""),
         provider_name=data.get("provider_name", "Murf"),
+        language=data.get("language", "hi-IN"),
         is_active=data.get("is_active", True),
+        sample_url=data.get("sample_url", ""),
     )
     return Response({"success": True, "voice": _serialize_tts_voice(voice)}, status=201)
 
@@ -248,16 +210,18 @@ def tts_voices(request):
 def tts_voice_detail(request, voice_id):
     """PATCH/DELETE /api/admin/tts-voices/<id>/"""
     try:
-        voice = TTSVoice.objects.get(id=voice_id)
+        voice = TTSVoice.objects.get(id=voice_id, flag='c')
     except TTSVoice.DoesNotExist:
         return Response({"success": False, "error": "voice not found"}, status=404)
 
     if request.method == "DELETE":
-        voice.delete()
+        voice.flag = 'd'
+        voice.save(update_fields=["flag", "updated_at"])
         return Response({"success": True})
 
     data = request.data
-    for field in ("voice_name", "gender", "provider_id", "provider_name", "is_active"):
+    for field in ("voice_name", "gender", "provider_voice_id", "provider_name",
+                  "language", "is_active", "sample_url"):
         if field in data:
             setattr(voice, field, data[field])
     voice.save()
@@ -265,41 +229,7 @@ def tts_voice_detail(request, voice_id):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SEGMENTS
-# ═══════════════════════════════════════════════════════════════
-
-@api_view(["GET", "POST"])
-def segments(request):
-    """
-    GET  /api/admin/segments/
-    POST /api/admin/segments/
-    """
-    if request.method == "GET":
-        qs = Segment.objects.all().order_by("name")
-        return Response({
-            "success": True,
-            "count": qs.count(),
-            "segments": [_serialize_segment(s) for s in qs],
-        })
-
-    data = request.data
-    name = data.get("name")
-    if not name:
-        return Response({"success": False, "error": "name is required"}, status=400)
-
-    if Segment.objects.filter(name=name).exists():
-        return Response({"success": False, "error": "segment already exists"}, status=409)
-
-    seg = Segment.objects.create(
-        name=name,
-        description=data.get("description"),
-        module=data.get("module"),
-    )
-    return Response({"success": True, "segment": _serialize_segment(seg)}, status=201)
-
-
-# ═══════════════════════════════════════════════════════════════
-# LLM SETTINGS (AI Persona)
+# LLM SETTINGS (AI Persona) — single-tenant: one active row normally
 # ═══════════════════════════════════════════════════════════════
 
 @api_view(["GET", "POST"])
@@ -309,7 +239,7 @@ def llm_settings(request):
     POST /api/admin/llm-settings/
     """
     if request.method == "GET":
-        qs = LLMSetting.objects.select_related("segment", "voice").order_by("segment__name")
+        qs = LLMSetting.objects.filter(flag='c').select_related("voice").order_by("-is_active", "name")
         return Response({
             "success": True,
             "count": qs.count(),
@@ -317,81 +247,85 @@ def llm_settings(request):
         })
 
     data = request.data
-    required = ["segment_id", "persona_name", "voice_id", "opening_line", "system_prompt"]
+    required = ["persona_name", "voice_id", "system_prompt"]
     for field in required:
         if not data.get(field):
             return Response({"success": False, "error": f"{field} is required"}, status=400)
 
     try:
-        segment = Segment.objects.get(id=data["segment_id"])
-    except Segment.DoesNotExist:
-        return Response({"success": False, "error": "segment not found"}, status=404)
-
-    try:
-        voice = TTSVoice.objects.get(id=data["voice_id"], is_active=True)
+        voice = TTSVoice.objects.get(id=data["voice_id"], is_active=True, flag='c')
     except TTSVoice.DoesNotExist:
         return Response({"success": False, "error": "active TTS voice not found"}, status=404)
 
-    if LLMSetting.objects.filter(segment=segment).exists():
-        return Response({"success": False, "error": "LLM setting already exists for this segment"}, status=409)
-
     setting = LLMSetting.objects.create(
-        segment=segment,
+        name=data.get("name", "default"),
+        is_active=data.get("is_active", True),
+        provider=data.get("provider", "gemini"),
+        model=data.get("model", "gemini-2.5-flash-lite"),
+        temperature=data.get("temperature", 0.4),
+        max_tokens=data.get("max_tokens", 1000),
         persona_name=data["persona_name"],
-        agent_name=data.get("agent_name", data["persona_name"]),
-        voice=voice,
-        opening_line=data["opening_line"],
+        opening_line=data.get("opening_line", ""),
         system_prompt=data["system_prompt"],
-        behaviour=data.get("behaviour"),
-        module=data.get("module", "service_reminder"),
+        behaviour=data.get("behaviour", ""),
+        voice=voice,
         tone=data.get("tone", 72),
         pace=data.get("pace", 50),
         barge_in_threshold=data.get("barge_in_threshold", 65),
         max_turns=data.get("max_turns", 10),
         allow_customer_barge_in=data.get("allow_customer_barge_in", True),
+        language=data.get("language", "hi-IN"),
+        response_max_chars=data.get("response_max_chars", 240),
+        questions_per_turn_max=data.get("questions_per_turn_max", 1),
     )
-    setting = LLMSetting.objects.select_related("segment", "voice").get(pk=setting.pk)
+    setting = LLMSetting.objects.select_related("voice").get(pk=setting.pk)
     return Response({"success": True, "setting": _serialize_llm_setting(setting)}, status=201)
 
 
 @api_view(['GET', 'PATCH'])
-def llm_setting_detail(request, segment_id):
-    """GET/PATCH /api/admin/llm-settings/<segment_id>/"""
+def llm_setting_detail(request, setting_id):
+    """GET/PATCH /api/admin/llm-settings/<setting_id>/"""
     try:
-        setting = LLMSetting.objects.select_related('segment', 'voice').get(segment__id=segment_id)
+        setting = LLMSetting.objects.select_related('voice').get(pk=setting_id, flag='c')
     except LLMSetting.DoesNotExist:
-        return Response({"success": False, "error": "no LLM setting for this segment"}, status=404)
+        return Response({"success": False, "error": "LLM setting not found"}, status=404)
 
     if request.method == 'GET':
         return Response({"success": True, "setting": _serialize_llm_setting(setting)})
 
     data = request.data
-    for field in ("persona_name", "agent_name", "opening_line", "system_prompt",
-                  "behaviour", "module", "tone", "pace", "max_turns",
-                  "allow_customer_barge_in", "barge_in_threshold"):
+    for field in ("name", "is_active", "provider", "model", "temperature", "max_tokens",
+                  "persona_name", "opening_line", "system_prompt", "behaviour", "tone",
+                  "pace", "max_turns", "allow_customer_barge_in", "barge_in_threshold",
+                  "language", "response_max_chars", "questions_per_turn_max"):
         if field in data:
             setattr(setting, field, data[field])
 
     if "voice_id" in data:
         try:
-            setting.voice = TTSVoice.objects.get(id=data["voice_id"], is_active=True)
+            setting.voice = TTSVoice.objects.get(id=data["voice_id"], is_active=True, flag='c')
         except TTSVoice.DoesNotExist:
             return Response({"success": False, "error": "active TTS voice not found"}, status=404)
 
     setting.save()
-    setting = LLMSetting.objects.select_related('segment', 'voice').get(pk=setting.pk)
+    setting = LLMSetting.objects.select_related('voice').get(pk=setting.pk)
     return Response({"success": True, "setting": _serialize_llm_setting(setting)})
 
 
 # ═══════════════════════════════════════════════════════════════
-# BARGE-IN HELPERS
+# BARGE-IN HELPERS (used by consumers.py at call-connect time)
 # ═══════════════════════════════════════════════════════════════
 
-def _get_barge_in_settings_sync(segment_name=None):
-    """Returns (allow_barge_in: bool, rms_threshold: int)."""
+def _get_barge_in_settings_sync(setting_name=None):
+    """Returns (allow_barge_in: bool, rms_threshold: int).
+    Single-tenant MVP: no segment concept — resolves by `name` if given,
+    else the active LLMSetting row."""
     try:
-        qs = LLMSetting.objects.select_related('segment')
-        setting = qs.filter(segment__name=segment_name).first() if segment_name else qs.first()
+        qs = LLMSetting.objects.filter(flag='c')
+        setting = (
+            qs.filter(name=setting_name).first() if setting_name
+            else qs.filter(is_active=True).first() or qs.first()
+        )
         if not setting:
             return BARGE_IN_DEFAULT_ENABLED, BARGE_IN_DEFAULT_RMS
 
@@ -405,23 +339,64 @@ def _get_barge_in_settings_sync(segment_name=None):
 
 
 # ═══════════════════════════════════════════════════════════════
+# CUSTOMER / CALL RESOLUTION HELPERS
+# (these did NOT exist anywhere in the previous file — consumers.py
+# imported them but they were never defined, which meant the app could
+# not have booted successfully before now)
+# ═══════════════════════════════════════════════════════════════
+
+def _resolve_customer_sync(phone_number=None, customer_id=None):
+    """
+    Resolve a Customer for an inbound/outbound call. Replaces the old
+    dealer/branch resolution — RecoverAI is single-tenant, so there is no
+    dealer to resolve. Returns a Customer instance or None.
+    """
+    if customer_id:
+        return Customer.objects.filter(id=customer_id, flag='c').first()
+    if phone_number:
+        return Customer.objects.filter(phone_number=phone_number, flag='c').first()
+    return None
+
+
+def _persist_recording_paths_sync(session_id, recording_stereo=None, recording_mixed=None):
+    """
+    Persist recording file paths onto a CallSession once a call's audio
+    has finished writing to disk. Returns the updated CallSession or None.
+    """
+    session = CallSession.objects.filter(session_id=session_id).first()
+    if not session:
+        logger.warning(f"[RECORDING] no CallSession for session_id={session_id}")
+        return None
+
+    update_fields = []
+    if recording_stereo is not None:
+        session.recording_stereo = recording_stereo
+        update_fields.append("recording_stereo")
+    if recording_mixed is not None:
+        session.recording_mixed = recording_mixed
+        update_fields.append("recording_mixed")
+
+    if update_fields:
+        update_fields.append("updated_at")
+        session.save(update_fields=update_fields)
+    return session
+
+
+# ═══════════════════════════════════════════════════════════════
 # CUSTOMERS
 # ═══════════════════════════════════════════════════════════════
 
 @api_view(['GET'])
 def customers_list(request):
-    """
-    GET /api/admin/customers/?dealer_id=1&search=&page=1&page_size=25 """
-    qs = Customer.objects.filter(flag='c').select_related('dealer', 'default_branch')
-
-    dealer_id = request.GET.get('dealer_id')
-    if dealer_id:
-        qs = qs.filter(dealer_id=dealer_id)
+    """GET /api/admin/customers/?search=&page=1&page_size=25"""
+    qs = Customer.objects.filter(flag='c')
 
     search = request.GET.get('search')
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(phone_number__icontains=search))
+        qs = qs.filter(Q(name__icontains=search) | Q(phone_number__icontains=search)
+                        | Q(account_reference__icontains=search))
 
+    qs = qs.order_by('-id')
     paginator = PageNumberPagination()
     paginator.page_size = 25
     paginator.page_size_query_param = "page_size"
@@ -432,10 +407,9 @@ def customers_list(request):
         "id": c.id,
         "name": c.name,
         "phone_number": c.phone_number,
-        "dealer": c.dealer.name if c.dealer else None,
-        "branch": c.default_branch.name if c.default_branch else None,
+        "account_reference": c.account_reference,
         "do_not_call": c.do_not_call,
-        "total_calls": getattr(c, 'total_calls', 0),
+        "total_calls": c.total_calls,
         "created_at": c.created_at.isoformat() if c.created_at else None,
     } for c in page]
 
@@ -446,8 +420,7 @@ def customers_list(request):
 def customer_detail(request, customer_id):
     """GET /api/admin/customers/<id>/"""
     customer = get_object_or_404(Customer, id=customer_id, flag='c')
-    vehicles = Vehicle.objects.filter(customer=customer, flag='c', is_sold_off=False)
-    cases = RecoveryCase.objects.filter(customer=customer).order_by('-created_at')[:10]
+    cases = RecoveryCase.objects.filter(customer=customer, flag='c').order_by('-created_at')[:10]
 
     return Response({
         "success": True,
@@ -455,24 +428,16 @@ def customer_detail(request, customer_id):
             "id": customer.id,
             "name": customer.name,
             "phone_number": customer.phone_number,
-            "dealer": customer.dealer.name if customer.dealer else None,
-            "branch": customer.default_branch.name if customer.default_branch else None,
+            "email": customer.email,
+            "account_reference": customer.account_reference,
+            "external_customer_id": customer.external_customer_id,
+            "preferred_language": customer.preferred_language,
             "do_not_call": customer.do_not_call,
+            "do_not_call_reason": customer.do_not_call_reason,
+            "total_calls": customer.total_calls,
             "created_at": customer.created_at.isoformat() if customer.created_at else None,
         },
-        "vehicles": [_serialize_vehicle_brief(v) for v in vehicles],
         "recovery_cases": [_serialize_recovery_case(c) for c in cases],
-    })
-
-
-@api_view(['GET'])
-def customer_vehicles(request, customer_id):
-    """GET /api/admin/customers/<id>/vehicles/"""
-    customer = get_object_or_404(Customer, id=customer_id, flag='c')
-    vehicles = Vehicle.objects.filter(customer=customer, flag='c', is_sold_off=False)
-    return Response({
-        "success": True,
-        "vehicles": [_serialize_vehicle_brief(v) for v in vehicles],
     })
 
 
@@ -488,14 +453,8 @@ class _RecordingPagination(PageNumberPagination):
 
 @api_view(["GET"])
 def recordings(request):
-    """
-    GET /api/admin/recordings/?page_size=25&search=&status=&intent=&outcome=
-    """
-    qs = (
-        CallSession.objects
-        .select_related("customer")
-        .order_by("-started_at")
-    )
+    """GET /api/admin/recordings/?page_size=25&search=&status=&intent=&outcome=&campaign_id="""
+    qs = CallSession.objects.filter(flag='c').select_related("customer").order_by("-started_at")
 
     search = request.GET.get("search")
     if search:
@@ -516,9 +475,9 @@ def recordings(request):
     if outcome_param:
         qs = qs.filter(recovery_outcome=outcome_param)
 
-    dealer_id = request.GET.get("dealer_id")
-    if dealer_id:
-        qs = qs.filter(dealer_id=dealer_id)
+    campaign_id = request.GET.get("campaign_id")
+    if campaign_id:
+        qs = qs.filter(campaign_id=campaign_id)
 
     paginator = _RecordingPagination()
     page = paginator.paginate_queryset(qs, request)
@@ -529,13 +488,10 @@ def recordings(request):
 
 @api_view(["GET"])
 def recording_audio(request, session_id):
-    """
-    GET /api/admin/recordings/<session_id>/audio/
-    Streams the recording file from disk. """
-    session = get_object_or_404(CallSession, pk=session_id)
+    """GET /api/admin/recordings/<session_id>/audio/ — streams the file from disk."""
+    session = get_object_or_404(CallSession, session_id=session_id, flag='c')
 
     path = session.recording_mixed or session.recording_stereo
-
     if not path:
         raise Http404("No recording file for this session")
 
@@ -556,30 +512,28 @@ def recording_audio(request, session_id):
 
 @api_view(["GET"])
 def call_detail_admin(request, session_id):
-    """
-    GET /api/admin/calls/<session_id>/
-    Full call detail with transcript, intent history, summary, outcome. """
+    """GET /api/admin/calls/<session_id>/ — full call detail."""
     session = get_object_or_404(
         CallSession.objects.select_related("customer"),
-        session_id=session_id,
+        session_id=session_id, flag='c',
     )
     turns = session.turns.filter(flag='c').order_by('timestamp')
 
     return Response({
         "success": True,
         "call": {
-            "session_id": str(session.session_id),
+            "session_id": session.session_id,
             "customer": _serialize_customer_brief(session.customer),
             "status": session.status,
             "intent": session.intent,
-            "recovery_outcome": getattr(session, 'recovery_outcome', None),
+            "recovery_outcome": session.recovery_outcome,
             "started_at": session.started_at.isoformat() if session.started_at else None,
             "ended_at": session.ended_at.isoformat() if session.ended_at else None,
             "duration_seconds": session.duration_seconds,
             "transcript": session.transcript,
-            "intent_history": getattr(session, 'intent_history', []),
-            "call_summary": getattr(session, 'call_summary', None),
-            "recording_mixed": getattr(session, 'recording_mixed', None),
+            "intent_history": session.intent_history,
+            "call_summary": session.call_summary,
+            "recording_mixed": session.recording_mixed,
             "stt_pricing": str(session.stt_pricing or 0),
             "tts_pricing": str(session.tts_pricing or 0),
             "llm_pricing": str(session.llm_pricing or 0),
@@ -606,49 +560,31 @@ def call_detail_admin(request, session_id):
 
 @api_view(['GET'])
 def recovery_dashboard(request):
-    """
-    GET /api/admin/recovery/dashboard/?dealer_id=1
-    Aggregate stats for the admin dashboard. """
-    dealer_id = request.GET.get('dealer_id')
+    """GET /api/admin/recovery/dashboard/?days=30&campaign_id="""
+    campaign_id = request.GET.get('campaign_id')
 
-    call_qs = CallSession.objects.all()
-    case_qs = RecoveryCase.objects.all()
-    cb_qs = Callback.objects.all()
-    pay_qs = PaymentRecord.objects.all()
+    call_qs = CallSession.objects.filter(flag='c')
+    case_qs = RecoveryCase.objects.filter(flag='c')
 
-    if dealer_id:
-        call_qs = call_qs.filter(dealer_id=dealer_id)
-        case_qs = case_qs.filter(dealer_id=dealer_id)
-        cb_qs = cb_qs.filter(dealer_id=dealer_id)
-        pay_qs = pay_qs.filter(dealer_id=dealer_id)
+    if campaign_id:
+        call_qs = call_qs.filter(campaign_id=campaign_id)
+        case_qs = case_qs.filter(campaign_id=campaign_id)
 
-    # Time window (default last 30 days)
     days = int(request.GET.get('days', 30))
     since = timezone.now() - timezone.timedelta(days=days)
     call_qs_window = call_qs.filter(started_at__gte=since)
 
-    totals = call_qs.aggregate(
-        total_calls=Count('id'),
-    )
-    windowed = call_qs_window.aggregate(
-        calls_attempted=Count('id'),
-    )
+    totals = call_qs.aggregate(total_calls=Count('id'))
+    windowed = call_qs_window.aggregate(calls_attempted=Count('id'))
 
-    connected = call_qs_window.filter(
-        status__in=['completed', 'connected']
-    ).count()
+    connected = call_qs_window.filter(status__in=['completed', 'ongoing']).count()
 
-    by_intent = call_qs_window.values('intent').annotate(
-        count=Count('id')
-    ).order_by('-count')
-
-    by_outcome = call_qs_window.values('recovery_outcome').annotate(
-        count=Count('id')
-    ).order_by('-count')
+    by_intent = call_qs_window.values('intent').annotate(count=Count('id')).order_by('-count')
+    by_outcome = call_qs_window.values('recovery_outcome').annotate(count=Count('id')).order_by('-count')
 
     complaints = call_qs_window.filter(intent='complaint').count()
     callbacks = call_qs_window.filter(intent='callback_requested').count()
-    declines = call_qs_window.filter(intent__in=['service_declined', 'not_interested']).count()
+    declines = call_qs_window.filter(intent__in=['refused_to_pay', 'not_interested']).count()
     wrong_numbers = call_qs_window.filter(intent='wrong_number').count()
 
     avg_duration = call_qs_window.filter(
@@ -664,11 +600,8 @@ def recovery_dashboard(request):
     )
 
     recovery_value = case_qs.filter(
-        status='closed',
-        closed_at__gte=since,
-    ).aggregate(
-        total_recovered=Sum('amount_recovered'),
-    )
+        status='closed', closed_at__gte=since,
+    ).aggregate(total_recovered=Sum('amount_recovered'))
 
     return Response({
         "success": True,
@@ -687,14 +620,8 @@ def recovery_dashboard(request):
             "wrong_numbers": wrong_numbers,
             "avg_duration_seconds": round(avg_duration, 1),
         },
-        "by_intent": [
-            {"intent": row["intent"], "count": row["count"]}
-            for row in by_intent if row["intent"]
-        ],
-        "by_outcome": [
-            {"outcome": row["recovery_outcome"], "count": row["count"]}
-            for row in by_outcome if row["recovery_outcome"]
-        ],
+        "by_intent": [{"intent": r["intent"], "count": r["count"]} for r in by_intent if r["intent"]],
+        "by_outcome": [{"outcome": r["recovery_outcome"], "count": r["count"]} for r in by_outcome if r["recovery_outcome"]],
         "costs": {
             "stt": str(cost_agg['total_stt'] or 0),
             "tts": str(cost_agg['total_tts'] or 0),
@@ -710,14 +637,8 @@ def recovery_dashboard(request):
 
 @api_view(['GET'])
 def recovery_callbacks(request):
-    """
-    GET /api/admin/recovery/callbacks/?dealer_id=1&status=pending
-    List scheduled callbacks. """
-    qs = Callback.objects.all().select_related('customer', 'session').order_by('-scheduled_for')
-
-    dealer_id = request.GET.get('dealer_id')
-    if dealer_id:
-        qs = qs.filter(dealer_id=dealer_id)
+    """GET /api/admin/recovery/callbacks/?status=requested"""
+    qs = Callback.objects.filter(flag='c').select_related('customer', 'session').order_by('-scheduled_for')
 
     status_param = request.GET.get('status')
     if status_param:
@@ -732,14 +653,12 @@ def recovery_callbacks(request):
 
 @api_view(['GET'])
 def recovery_cases(request):
-    """
-    GET /api/admin/recovery/cases/?dealer_id=1&status=open
-    List recovery cases. """
-    qs = RecoveryCase.objects.all().select_related('customer').order_by('-created_at')
+    """GET /api/admin/recovery/cases/?status=open&campaign_id="""
+    qs = RecoveryCase.objects.filter(flag='c').select_related('customer').order_by('-created_at')
 
-    dealer_id = request.GET.get('dealer_id')
-    if dealer_id:
-        qs = qs.filter(dealer_id=dealer_id)
+    campaign_id = request.GET.get('campaign_id')
+    if campaign_id:
+        qs = qs.filter(campaign_id=campaign_id)
 
     status_param = request.GET.get('status')
     if status_param:
@@ -762,13 +681,11 @@ def campaigns(request):
     GET  /api/admin/campaigns/
     POST /api/admin/campaigns/
     """
-    from .models import RecoveryCampaign
-
     if request.method == 'GET':
-        qs = RecoveryCampaign.objects.all().order_by('-created_at')
-        dealer_id = request.GET.get('dealer_id')
-        if dealer_id:
-            qs = qs.filter(dealer_id=dealer_id)
+        qs = RecoveryCampaign.objects.filter(flag='c').order_by('-created_at')
+        status_param = request.GET.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
 
         return Response({
             "success": True,
@@ -777,12 +694,14 @@ def campaigns(request):
                 {
                     "id": c.id,
                     "name": c.name,
-                    "dealer_id": c.dealer_id,
-                    "module": getattr(c, 'module', None),
+                    "campaign_type": c.campaign_type,
                     "status": c.status,
-                    "customer_count": getattr(c, 'customer_count', 0),
+                    "customer_count": c.customer_count,
+                    "calls_attempted": c.calls_attempted,
+                    "cases_recovered": c.cases_recovered,
+                    "amount_recovered": str(c.amount_recovered),
                     "created_at": c.created_at.isoformat() if c.created_at else None,
-                    "started_at": c.started_at.isoformat() if getattr(c, 'started_at', None) else None,
+                    "started_at": c.started_at.isoformat() if c.started_at else None,
                 }
                 for c in qs
             ],
@@ -790,34 +709,27 @@ def campaigns(request):
 
     data = request.data
     name = data.get('name')
-    dealer_id = data.get('dealer_id')
-    module = data.get('module', 'service_reminder')
-
-    if not name or not dealer_id:
-        return Response({"success": False, "error": "name and dealer_id required"}, status=400)
+    if not name:
+        return Response({"success": False, "error": "name required"}, status=400)
 
     campaign = RecoveryCampaign.objects.create(
         name=name,
-        dealer_id=dealer_id,
-        module=module,
+        campaign_type=data.get('campaign_type', 'payment'),
+        description=data.get('description', ''),
         status='draft',
+        target_due_within_days=data.get('target_due_within_days', 14),
     )
     return Response({
         "success": True,
-        "campaign": {
-            "id": campaign.id,
-            "name": campaign.name,
-            "status": campaign.status,
-        }
+        "campaign": {"id": campaign.id, "name": campaign.name, "status": campaign.status},
     }, status=201)
 
 
 @api_view(['GET', 'PATCH'])
 def campaign_detail(request, campaign_id):
     """GET/PATCH /api/admin/campaigns/<id>/"""
-    from .models import RecoveryCampaign
     try:
-        campaign = RecoveryCampaign.objects.get(id=campaign_id)
+        campaign = RecoveryCampaign.objects.get(id=campaign_id, flag='c')
     except RecoveryCampaign.DoesNotExist:
         return Response({"success": False, "error": "not found"}, status=404)
 
@@ -825,15 +737,21 @@ def campaign_detail(request, campaign_id):
         return Response({"success": True, "campaign": {
             "id": campaign.id,
             "name": campaign.name,
-            "dealer_id": campaign.dealer_id,
-            "module": getattr(campaign, 'module', None),
+            "campaign_type": campaign.campaign_type,
+            "description": campaign.description,
             "status": campaign.status,
-            "customer_count": getattr(campaign, 'customer_count', 0),
+            "customer_count": campaign.customer_count,
+            "calls_attempted": campaign.calls_attempted,
+            "calls_connected": campaign.calls_connected,
+            "cases_recovered": campaign.cases_recovered,
+            "amount_recovered": str(campaign.amount_recovered),
             "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+            "started_at": campaign.started_at.isoformat() if campaign.started_at else None,
+            "finished_at": campaign.finished_at.isoformat() if campaign.finished_at else None,
         }})
 
     data = request.data
-    for field in ('name', 'status', 'module'):
+    for field in ('name', 'status', 'campaign_type', 'description', 'target_due_within_days'):
         if field in data:
             setattr(campaign, field, data[field])
     campaign.save()
@@ -841,7 +759,7 @@ def campaign_detail(request, campaign_id):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TTS TEST (admin only — not exposed in customer-facing routes)
+# TTS TEST (admin only)
 # ═══════════════════════════════════════════════════════════════
 
 @csrf_exempt
@@ -874,4 +792,4 @@ def admin_test_tts(request):
 @api_view(['GET'])
 def get_voice_options(request):
     """GET /api/admin/voice-options/ — available TTS provider/voice matrix"""
-        return Response(settings.TTS_PROVIDERS)
+    return Response(settings.TTS_PROVIDERS)
