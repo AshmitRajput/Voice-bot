@@ -19,7 +19,7 @@ from recovery_agent.tools.tool_registry import (
     mark_call_for_ending,
 )
 from recovery_agent.tools.callback_tools import schedule_callback
-from recovery_agent.tools.recovery_tools import update_recovery_case
+from recovery_agent.tools.recovery_tools import update_recovery_case, record_call_completion
 
 logger = logging.getLogger("voice_bot")
 
@@ -101,6 +101,20 @@ def _schedule_callback(args: dict) -> dict:
             ),
         )
 
+        # Infrastructure fallback, same as _end_call: the callback path is
+        # a valid way for a call to finish, but nothing was previously
+        # calling record_call_completion() here -- only mark_call_for_ending
+        # was called. That left the CallSession row stuck at
+        # status="ongoing" forever, with no ended_at/duration_seconds, for
+        # every call that ended via callback. record_call_completion()
+        # closes out the CallSession the same way _end_call does; reason
+        # "callback" is not in _CASE_CLOSING_REASONS so it will NOT close
+        # the RecoveryCase itself -- only end_call's non-callback reasons do.
+        completion_result = record_call_completion(
+            session_id=session_id,
+            reason="callback",
+        )
+
         mark_call_for_ending(session_id, "callback")
 
     except Exception as e:
@@ -116,6 +130,7 @@ def _schedule_callback(args: dict) -> dict:
         "reason": "callback",
         "scheduled": callback_result,
         "case_update": case_update,
+        "recovery_call_recorded": completion_result,
         "message": closing_message,
     }
 

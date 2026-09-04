@@ -1,24 +1,19 @@
 """
-Recovery Intent Service — the ONE canonical classifier for RecoverAI.
-
-This file answers ONLY one question:
+Recovery Intent Service — RecoverAI edition. The ONE canonical classifier. Answers only ONE question:
     "What did the customer say?"
 
 It does NOT generate responses. It does NOT decide actions. It does NOT
-take recovery actions. It ONLY returns intent + confidence + entities.
-
-The orchestrator (recovery_service.py) consumes this output and decides
-what to do. """
+take recovery actions. The orchestrator (recovery_service.py) consumes
+this output and decides what to do. """
 
 import json
 import logging
 import os
+import re
 
 import requests
 
-from .llm_service import llm_service
-
-logger = logging.getLogger('voice_bot')
+logger = logging.getLogger('recovery_agent')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,13 +68,10 @@ INTENTS = [
 # RECOVERY ACTIONS — separate from intent
 # ═══════════════════════════════════════════════════════════════
 
-# Maps intent -> suggested recovery action. The orchestrator still has
-# final say (and may override based on context), but this is the default.
-
 RECOVERY_ACTIONS = {
     # Conversation opening
-    "greeting":              {"action": "continue_recovery_conversation", "filler": False},
-    "identity_confirmed":    {"action": "proceed_with_recovery",          "filler": False},
+    "greeting":              {"action": "continue_recovery_conversation", "filler": False, "next_step": "state_purpose"},
+    "identity_confirmed":    {"action": "proceed_with_recovery",          "filler": False, "next_step": "explain_balance"},
 
     # Payment recovery
     "payment_done":                  {"action": "verify_payment",            "filler": True,  "next_step": "verification"},
@@ -119,10 +111,7 @@ RECOVERY_ACTIONS = {
 }
 
 
-# Call OUTCOME enum — what HAPPENED in this call (separate from intent).
-# Set post-call by recovery_service, NOT by the live classifier.
-
-CALL_OUTCOMES = [
+# Call OUTCOME enum — what HAPPENED in this call (separate from intent). # Set post-call by recovery_service, NOT by the live classifier. CALL_OUTCOMES = [
     "recovered",                     # payment verified + case closed
     "promise_to_pay",                # PTP recorded
     "payment_link_sent",             # link generated/sent successfully
@@ -142,9 +131,7 @@ CALL_OUTCOMES = [
 ]
 
 
-# Recovery STATUS — where the case IS in the recovery lifecycle.
-
-RECOVERY_STATUSES = [
+# Recovery STATUS — where the case IS in the recovery lifecycle. RECOVERY_STATUSES = [
     "pending",
     "in_progress",
     "payment_verified",
@@ -164,9 +151,7 @@ RECOVERY_STATUSES = [
 # CLASSIFIER
 # ═══════════════════════════════════════════════════════════════
 
-CLASSIFICATION_PROMPT = """You are a strict intent classifier for a Hindi/Hinglish revenue-recovery voice agent.
-
-Your ONLY job is to read the customer's LAST utterance and output a JSON object with:
+CLASSIFICATION_PROMPT = """You are a strict intent classifier for a Hindi/Hinglish revenue-recovery voice agent. Your ONLY job is to read the customer's LAST utterance and output a JSON object with:
   - intent:    ONE of the canonical intents below
   - confidence: 0.0 to 1.0
   - entities:  any structured values you can extract (dates, times, reasons)
@@ -185,44 +170,20 @@ CONVERSATION OPENING
 - identity_confirmed:      "Haan main Rahul bol raha hoon", "Yes speaking"
 
 PAYMENT RECOVERY
-- payment_done:                  Customer claims payment is already made.
-- payment_pending:               Customer acknowledges payment is still pending.
-- promise_to_pay:                Customer commits to paying at a future time.
-                                 → entities.promise_date, entities.promise_time
-- payment_link_requested:        Customer wants a payment link sent.
-- payment_link_resend_requested: Customer wants the link sent again / link expired.
-- payment_link_received:         Customer confirms they received the link.
-- payment_link_failed:           Customer says the link isn't working / errored.
-
-REFUSAL / OBJECTION
-- refused_to_pay:       Customer explicitly says they will not pay.
-- not_interested:       Customer doesn't want to continue this conversation.
-- financial_hardship:   Customer cites money problems as the reason.
-- dispute:              Customer disputes the amount or the obligation itself.
-
-INFORMATION
+- payment_done:                  Customer claims payment is already made. - payment_pending:               Customer acknowledges payment is still pending. - promise_to_pay:                Customer commits to paying at a future time. → entities.promise_date, entities.promise_time
+- payment_link_requested:        Customer wants a payment link sent. - payment_link_resend_requested: Customer wants the link sent again / link expired. - payment_link_received:         Customer confirms they received the link. - payment_link_failed:           Customer says the link isn't working / errored. REFUSAL / OBJECTION
+- refused_to_pay:       Customer explicitly says they will not pay. - not_interested:       Customer doesn't want to continue this conversation. - financial_hardship:   Customer cites money problems as the reason. - dispute:              Customer disputes the amount or the obligation itself. INFORMATION
 - payment_amount_question:    "Kitna pay karna hai?"
 - payment_due_date_question:  "Last date kab hai?"
 - payment_reason_question:    "Ye payment kisliye hai?"
 - clarification_requested:    "Thoda detail mein batao", "Samjhao"
 
 FOLLOW-UP
-- callback_requested:  Customer asks to be called later.
-                       → entities.callback_date, entities.context_callback_time
-- callback_confirmed:  Customer confirms a previously proposed callback.
-
-EXCEPTIONS
-- complaint:         Customer has a complaint (about service, calls, staff, etc.).
-- wrong_number:      Number doesn't belong to the intended customer.
-- account_not_owned: Customer says the account/vehicle is no longer theirs.
-
-TERMINATION
-- goodbye:           Natural conversation ending.
-
-FALLBACK
-- unclear:           The utterance is ambiguous, off-topic, or uninterpretable.
-
-═══════════════════════════════════════════════════════════════
+- callback_requested:  Customer asks to be called later. → entities.callback_date, entities.context_callback_time
+- callback_confirmed:  Customer confirms a previously proposed callback. EXCEPTIONS
+- complaint:         Customer has a complaint (about service, calls, staff, etc.). - wrong_number:      Number doesn't belong to the intended customer. - account_not_owned: Customer says the account/vehicle is no longer theirs. TERMINATION
+- goodbye:           Natural conversation ending. FALLBACK
+- unclear:           The utterance is ambiguous, off-topic, or uninterpretable. ═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT (strict JSON, nothing else)
 ═══════════════════════════════════════════════════════════════
 
@@ -250,12 +211,116 @@ LAST CUSTOMER UTTERANCE
 """
 
 
+# Lightweight keyword-based fallback (works even without an LLM)
+# Maps Hindi/Hinglish keyword patterns -> intent. Used when no LLM key
+# is configured OR the LLM call fails. #
+
+_HINDI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+def _kw_match(text, patterns):
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+_KEYWORD_RULES = [
+    # Payment
+    ("payment_done", [
+        r"\b(paid|pay kar diya|kar diya hai|kar chuka|kar chuki|bhar diya|bhar di)\b",
+        r"payment (ho gaya|kar diya|karta|karke)\b",
+    ]),
+    ("payment_pending", [
+        r"\b(pending|baki|baaki|nahi kiya|nahi hua|nahi kar paya)\b",
+        r"abhi tak nahi|abhi nahi\b",
+    ]),
+    ("promise_to_pay", [
+        r"\b(kal|parson|aaj|agle|next|promise|kar dunga|kar dungi|karunga|karungi)\b",
+        r"\d+\s*(tareekh|tarikh|ko|date)\b",
+    ]),
+    ("payment_link_requested", [
+        r"\b(link bhej|link chahiye|link do|payment link|upi link|qr code)\b",
+    ]),
+    ("payment_link_resend_requested", [
+        r"\b(phir se|dobara|resend|link expire|link nahi mila|link nahi aaya)\b",
+    ]),
+    ("payment_link_received", [
+        r"\b(link aa gaya|mil gaya|link mila|received|got it)\b",
+    ]),
+    ("payment_link_failed", [
+        r"\b(link (kharab|crash|error|open nahi)|error aa|page nahi khul)\b",
+    ]),
+
+    # Refusal
+    ("refused_to_pay", [
+        r"\b(pay nahi karunga|nahi dunga|nahi dungi|nahi karunga|nahi karungi|nahi dena|nahi bharna)\b",
+        r"main (nahi|nहीं) (dunga|karunga|bharunga|pay karunga)\b",
+    ]),
+    ("not_interested", [
+        r"\b(interest nahi|fark nahi|mat karo|rehne do|chhod do)\b",
+    ]),
+    ("financial_hardship", [
+        r"\b(paise nahi|job chali|naukri gayi|money problem|financial|garib|gareeb)\b",
+    ]),
+    ("dispute", [
+        r"\b(galat hai|galat amount|amount galat|bill galat|dispute|kya charge|kab ka hai|main (nahi) (dunga|paya))\b",
+    ]),
+
+    # Information
+    ("payment_amount_question", [
+        r"\b(kitna|kitne|kya amount|kitne (ka|paise|rupees))\b",
+    ]),
+    ("payment_due_date_question", [
+        r"\b(kab tak|last date|due date|deadline|kab tak bharna|deadline kab)\b",
+    ]),
+    ("payment_reason_question", [
+        r"\b(kisliye|kis baare|kya hai ye|kyun|kyu|kyunki|reason)\b",
+    ]),
+    ("clarification_requested", [
+        r"\b(samjhao|samjha do|detail mein|thoda aur|explain|clarify|clear karo)\b",
+    ]),
+
+    # Callback
+    ("callback_requested", [
+        r"\b(call back|baad mein call|phir call|kal call|shaam ko call|agle hafte|next week)\b",
+        r"\b(callback|baad mein|fir kab)\b",
+    ]),
+    ("callback_confirmed", [
+        r"\b(haan|theek hai|ok|okay|thik hai|chalega)\b",
+    ]),
+
+    # Exceptions
+    ("complaint", [
+        r"\b(shikayat|complaint|pareshan|tang|naraaz|ganda|kharab service|worst)\b",
+    ]),
+    ("wrong_number", [
+        r"\b(galat number|galat number hai|ye number nahi|kiska number)\b",
+    ]),
+    ("account_not_owned", [
+        r"\b(mera nahi|account mera nahi|naam alag|galti se|wrong person)\b",
+    ]),
+
+    # Termination
+    ("goodbye", [
+        r"^\s*(bye|goodbye|tata|alvida|phir milenge|baad mein milte)\b",
+    ]),
+
+    # Conversation
+    ("greeting", [
+        r"^\s*(namaste|namaskar|hello|hi|hey)\b",
+    ]),
+    ("identity_confirmed", [
+        r"\b(haan main|main hi|yes speaking|main bol raha|main bol rahi|main hi bol)\b",
+    ]),
+]
+
+
 class RecoveryIntentService:
     """
     The single canonical intent classifier for the RecoverAI voice agent. """
 
     def __init__(self):
         self.intents = INTENTS
+        self._gemini_key = os.environ.get("GOOGLE_API_KEY", "")
+        self._use_llm = bool(self._gemini_key)
 
     # ───────────────────────────────────────────────────────────
     # Public API
@@ -272,46 +337,18 @@ class RecoveryIntentService:
                 "raw":         <raw model text, for debugging>,
             }
         """
-        history_str = self._format_history(history or [])
-        prompt = CLASSIFICATION_PROMPT.format(
-            history=history_str or "(no prior context)",
-            customer_text=customer_text,
-        )
-
-        result = llm_service.generate(
-            prompt=prompt,
-            system_prompt=(
-                "You are a strict intent classifier. Output only valid JSON. "
-                "Never write explanations, never write conversational text. "
-                "Never invent intents outside the provided list."
-            ),
-            max_tokens=200,
-            temperature=0.0,
-        )
-
-        if not result.get("success"):
-            logger.warning(
-                f"[INTENT] classifier call failed: {result.get('error')}; "
-                f"falling back to 'unclear'"
-            )
-            return {
-                "intent": "unclear",
-                "confidence": 0.0,
-                "entities": {},
-                "raw": "",
-            }
-
-        raw_text = result.get("text", "")
-        parsed = self._parse_json_response(raw_text)
-        validated = self._validate_and_normalize(parsed)
-
-        validated["raw"] = raw_text
-        return validated
+        if self._use_llm:
+            try:
+                return self._classify_with_llm(customer_text, history or [])
+            except Exception as e:
+                logger.warning(
+                    f"[INTENT] LLM classification failed: {e}; falling back to keywords"
+                )
+        return self._classify_with_keywords(customer_text)
 
     def get_response_strategy(self, intent):
         """
-        Return the recovery-action strategy for a given intent.
-        The orchestrator still chooses whether to actually invoke it —
+        Return the recovery-action strategy for a given intent. The orchestrator still chooses whether to actually invoke it —
         this is the default mapping only. """
         return RECOVERY_ACTIONS.get(
             intent,
@@ -333,6 +370,54 @@ class RecoveryIntentService:
                 continue
             lines.append(f"{role}: {text}")
         return "\n".join(lines)
+
+    def _classify_with_llm(self, customer_text, history):
+        """Use Gemini (or any OpenAI-compatible LLM via GOOGLE_API_KEY) to classify."""
+        history_str = self._format_history(history)
+        prompt = CLASSIFICATION_PROMPT.format(
+            history=history_str or "(no prior context)",
+            customer_text=customer_text,
+        )
+
+        # Gemini REST API (no SDK needed)
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={self._gemini_key}"
+        )
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 200,
+            },
+        }
+        resp = requests.post(url, json=body, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = self._parse_json_response(raw)
+        validated = self._validate_and_normalize(parsed)
+        validated["raw"] = raw
+        return validated
+
+    def _classify_with_keywords(self, customer_text):
+        """Pure-Python keyword-based fallback (works without any LLM)."""
+        text = customer_text or ""
+        # Pick the FIRST matching rule (rules are ordered roughly by priority)
+        for intent, patterns in _KEYWORD_RULES:
+            if _kw_match(text, patterns):
+                return {
+                    "intent": intent,
+                    "confidence": 0.7,
+                    "entities": {},
+                    "raw": f"[keyword-match: {intent}]",
+                }
+        return {
+            "intent": "unclear",
+            "confidence": 0.0,
+            "entities": {},
+            "raw": "",
+        }
 
     def _parse_json_response(self, text):
         """Tolerate fences / extra prose; pull the first JSON object out."""
@@ -390,5 +475,8 @@ class RecoveryIntentService:
         }
 
 
-# Module-level singleton — referenced from views.py / recovery_service.py
+# Module-level singleton
 recovery_intent_service = RecoveryIntentService()
+
+# Back-compat: also expose as `intent_service` for old imports
+intent_service = recovery_intent_service

@@ -1,73 +1,51 @@
 """
 callback_tools.py
 
-Plain callback-request domain logic for the Recovery Agent.
+Compatibility shim for older code that imports `schedule_callback` from
+recovery_agent.tools.callback_tools. Delegates to CallbackService, which is
+the single owner of Callback writes.
 
-The implementation is file-backed for the initial buildathon version and can
-later be replaced with a Django ORM service without changing the LLM-facing
-callback tool definition.
+FIX vs. previous version: the old lookup was
+    Customer.objects.filter(phone_number=phone_number, flag="c")
+`flag` is not a field on the real Customer model -- this would raise
+FieldError on first use. Filtering on phone_number alone is enough here.
+
+FIX vs. this file's earlier version: callback_service.schedule_callback()
+no longer takes callback_date/callback_time at all. The real signature is:
+
+    schedule_callback(customer_id, requested_window=None,
+                       reason="customer_requested", session_id=None)
+
+The service does its own heuristic day/time resolution against
+requested_window internally (see callback_service.py's _heuristic_resolve)
+and writes the required scheduled_for DateTimeField itself. This file must
+not attempt to parse or split the customer's phrase -- it just passes it
+through whole as requested_window.
 """
-
-import datetime
-import json
-import os
-import threading
-import uuid
-
-CALLBACKS_FILE = os.path.join(os.path.dirname(__file__), "_callbacks_store.json")
-_lock = threading.Lock()
-
-
-def _load_callbacks() -> list:
-    if not os.path.exists(CALLBACKS_FILE):
-        return []
-    try:
-        with open(CALLBACKS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def _save_callbacks(callbacks: list):
-    temp_path = f"{CALLBACKS_FILE}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(callbacks, f, ensure_ascii=False, indent=2)
-    os.replace(temp_path, CALLBACKS_FILE)
 
 
 def schedule_callback(
-    session_id: str,
-    phone_number: str = None,
-    customer_name: str = "Customer",
-    reason: str = None,
-    requested_for: str = None,
-) -> dict:
-    """Record a customer-requested callback.
+    session_id,
+    phone_number=None,
+    customer_name="Customer",
+    reason=None,
+    requested_for=None,
+):
+    """Legacy function -- delegates to the new callback service."""
+    from recovery_agent.services.callback_service import callback_service
+    from recovery_agent.models import Customer
 
-    requested_for is optional. If the customer did not give a date/time, it is
-    left as None instead of inventing a date. This is important for recovery
-    calls because the customer may ask for a callback without specifying when.
-    """
-    if not session_id:
-        raise ValueError("session_id is required")
+    customer = (
+        Customer.objects.filter(phone_number=phone_number).first()
+        if phone_number
+        else None
+    )
+    if not customer:
+        return {"scheduled": False, "error": "customer not found for this phone number"}
 
-    if requested_for:
-        requested_for = requested_for.strip() or None
-
-    with _lock:
-        callbacks = _load_callbacks()
-        record = {
-            "callback_id": f"cb_{uuid.uuid4().hex[:12]}",
-            "session_id": str(session_id),
-            "phone_number": phone_number,
-            "customer_name": customer_name or "Customer",
-            "reason": reason,
-            "requested_for": requested_for,
-            "status": "pending",
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        callbacks.append(record)
-        _save_callbacks(callbacks)
-
-    return {"scheduled": True, **record}
+    return callback_service.schedule_callback(
+        customer_id=customer.id,
+        requested_window=requested_for,
+        reason=reason or "customer_requested",
+        session_id=session_id,
+    )

@@ -1,37 +1,14 @@
 """
 Cloud LLM service layer — RecoverAI (BharatRouter / Gemma 4 31B) edition.
-
-WHAT THIS FILE DOES
-- Wraps the BharatRouter / cloud-LLM HTTP client.
-- Streams / non-streams LLM turns.
-- Resolves RAG context (dealer/module/branch scoped).
-- Wires in recovery tools from tool_registry.
-- Tracks usage (tokens / cost) per turn.
-
-WHAT THIS FILE DOES NOT DO
-- It does NOT classify intent. (intent_service does that.)
-- It does NOT decide recovery actions. (recovery_service does that.)
-- It does NOT touch the database for recovery state.
-
-RECOVERY-AI CONTEXT SHAPE
-    context = {
-        "customer": {"name": "...", "phone": "...", "outstanding_amount": ..., "due_date": "..."},
-        "recovery": {"type": "payment|service|general", "status": "...", "attempt_number": ...},
-        "current_turn": {"intent": "...", "confidence": ..., "entities": {...}},
-        "dealer": <Dealer>,
-        "module": "payment_recovery|service_recovery|...",
-        ...
-    }
 """
 
 import logging
 
 from .cloud_llm.schemas import TurnResult, LiveTurnResult
-from .cloud_llm import get_cloud_llm_client
+from .cloud_llm import BharatRouterClient
 from .cloud_llm.prompt_builder import get_persona_instruction
 from .rag_service import get_rag_service
-from voice_bot.tools import tool_registry
-from .cloud_llm import BharatRouterClient
+from recovery_agent.tools import tool_registry
 
 logger = logging.getLogger("voice_bot")
 
@@ -46,25 +23,20 @@ def get_cloud_llm_client():
 
 
 # ═══════════════════════════════════════════════════════════════
-# RAG RESOLUTION
+# RAG RESOLUTION — category-scoped, no dealer/branch
 # ═══════════════════════════════════════════════════════════════
 
-def _get_rag_reference(dealer, module, customer_text, branch=None, top_k=3):
+def _get_rag_reference(category, customer_text, top_k=3):
     try:
         rag = get_rag_service()
-        result = rag.ask_question(
-            dealer, module, customer_text, branch=branch, top_k=top_k,
-        )
+        result = rag.ask_question(category, customer_text, top_k=top_k)
 
         logger.debug(
-            "[RAG] dealer=%s module=%s branch=%s query=%r -> success=%s "
-            "n_contexts=%d best_distance=%s timing=%s",
-            getattr(dealer, "code", dealer), module,
-            getattr(branch, "id", branch),
-            customer_text, result.get("success"),
+            "[RAG] category=%s query=%r -> success=%s n_contexts=%d "
+            "best_distance=%s timing=%s",
+            category, customer_text, result.get("success"),
             len(result.get("contexts", [])),
-            result.get("best_distance"),
-            result.get("timing_ms"),
+            result.get("best_distance"), result.get("timing_ms"),
         )
 
         contexts = result.get("contexts", [])
@@ -80,24 +52,11 @@ def _get_rag_reference(dealer, module, customer_text, branch=None, top_k=3):
 
 
 def _resolve_reference(customer_text, context, use_rag, reference_context):
-    """
-    Resolve RAG reference AND merge with any caller-supplied reference
-    context, instead of letting one silently override the other. """
     if not use_rag:
         return reference_context
 
-    dealer = context.get("dealer")
-    module = context.get("module", "general_recovery")
-    branch = context.get("branch_obj")
-
-    if dealer is None:
-        logger.warning(
-            "RAG requested but context has no 'dealer'; "
-            "skipping RAG lookup, returning caller's reference_context as-is"
-        )
-        return reference_context
-
-    rag_context = _get_rag_reference(dealer, module, customer_text, branch=branch)
+    category = context.get("rag_category", "communication_policy")
+    rag_context = _get_rag_reference(category, customer_text)
 
     if rag_context and reference_context:
         return f"{reference_context}\n\n{rag_context}"
@@ -121,7 +80,6 @@ def _extract_usage(client) -> dict:
     }
 
 
-# Krutrim / BharatRouter Gemma 4 31B pricing: ₹9 in / ₹33 out per 1M tokens.
 LLM_PRICE_PER_MTOK_IN = 9
 LLM_PRICE_PER_MTOK_OUT = 33
 
@@ -137,17 +95,16 @@ def _calculate_llm_pricing(prompt_tokens, output_tokens) -> float:
 # WARMUP
 # ═══════════════════════════════════════════════════════════════
 
-def warmup_module(module: str):
-    """
-    Fire a throwaway generate_turn_stream() call for this call's module
-    during greeting playback, so the customer's first utterance latency
-    doesn't pay the connection/pod warm-up cost. """
+def warmup_module(workflow: str = "revenue_recovery"):
+    """Fire a throwaway generate_turn_stream() call during greeting
+    playback so the customer's first utterance doesn't pay connection
+    warm-up cost."""
     client = get_cloud_llm_client()
     dummy_context = {
         "customer_name": "Warmup",
-        "vehicle_model": "Warmup",
-        "due_date": "01/01/2026",
-        "module": module,
+        "outstanding_amount": "0",
+        "due_date": "warmup",
+        "workflow": workflow,
         "today": "warmup",
         "current_datetime_ist": "warmup",
     }
@@ -159,9 +116,9 @@ def warmup_module(module: str):
             tools=None,
         ):
             pass
-        print(f"✅ [WARMUP] connection primed for module={module}")
+        print(f"✅ [WARMUP] connection primed for workflow={workflow}")
     except Exception as e:
-        print(f"⚠️ [WARMUP] failed for module={module}: {e}")
+        print(f"⚠️ [WARMUP] failed for workflow={workflow}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -169,24 +126,13 @@ def warmup_module(module: str):
 # ═══════════════════════════════════════════════════════════════
 
 def chat_turn(
-    session_id,
-    customer_text,
-    context,
-    history=None,
-    use_rag=True,
-    reference_context=None,
-    filler_text=None,
-    interrupted_context=None,
+    session_id, customer_text, context, history=None, use_rag=True,
+    reference_context=None, filler_text=None, interrupted_context=None,
 ):
-    """Non-streaming live turn."""
+    """Non-streaming turn."""
     client = get_cloud_llm_client()
-
-    reference_context = _resolve_reference(
-        customer_text, context, use_rag, reference_context,
-    )
-
+    reference_context = _resolve_reference(customer_text, context, use_rag, reference_context)
     tool_session_token = tool_registry.set_tool_session(session_id)
-
     try:
         result = client.generate_turn(
             customer_text=customer_text,
@@ -198,33 +144,20 @@ def chat_turn(
         )
     finally:
         tool_registry.reset_tool_session(tool_session_token)
-
     result["usage"] = _extract_usage(client)
     return result
 
 
 def chat_turn_stream(
-    session_id,
-    customer_text,
-    context,
-    history=None,
-    use_rag=True,
-    reference_context=None,
-    filler_text=None,
-    interrupted_context=None,
+    session_id, customer_text, context, history=None, use_rag=True,
+    reference_context=None, filler_text=None, interrupted_context=None,
 ):
     """Streaming voice-bot path."""
     client = get_cloud_llm_client()
-    module = context.get("module", "service_recovery")
-
-    tools = tool_registry.get_tool_declarations(module)
-
-    reference_context = _resolve_reference(
-        customer_text, context, use_rag, reference_context,
-    )
-
+    workflow = context.get("workflow", "revenue_recovery")
+    tools = tool_registry.get_tool_declarations(workflow)
+    reference_context = _resolve_reference(customer_text, context, use_rag, reference_context)
     tool_session_token = tool_registry.set_tool_session(session_id)
-
     try:
         for chunk in client.generate_turn_stream(
             customer_text=customer_text,
@@ -241,7 +174,6 @@ def chat_turn_stream(
 
 
 def get_last_turn_usage() -> dict:
-    """Snapshot the shared client's usage state right after a turn finishes."""
     client = get_cloud_llm_client()
     return _extract_usage(client)
 
@@ -250,12 +182,8 @@ def get_last_turn_usage() -> dict:
 # POST-TURN SCORING
 # ═══════════════════════════════════════════════════════════════
 
-def score_and_price_turn(
-    customer_text, bot_response_text, filler_text,
-    turn_prompt_tokens, turn_output_tokens,
-):
-    """
-    Per-turn accuracy + filler_accuracy scoring + llm_pricing calculation. """
+def score_and_price_turn(customer_text, bot_response_text, filler_text,
+                          turn_prompt_tokens, turn_output_tokens):
     client = get_cloud_llm_client()
     result = client.score_turn(
         customer_text=customer_text,
@@ -264,18 +192,15 @@ def score_and_price_turn(
         turn_prompt_tokens=turn_prompt_tokens,
         turn_output_tokens=turn_output_tokens,
     )
-    result["llm_pricing"] = _calculate_llm_pricing(
-        turn_prompt_tokens, turn_output_tokens,
-    )
+    result["llm_pricing"] = _calculate_llm_pricing(turn_prompt_tokens, turn_output_tokens)
     return result
 
 
 # ═══════════════════════════════════════════════════════════════
-# TIMING — pure dict math, no DB
+# TIMING
 # ═══════════════════════════════════════════════════════════════
 
 def build_timing_record(timing: dict) -> dict:
-    """Convert raw timing float stamps into ms dict."""
     timing = timing or {}
 
     def ms(key_end, key_start):
