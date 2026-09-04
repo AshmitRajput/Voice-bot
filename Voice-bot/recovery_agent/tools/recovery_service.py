@@ -53,140 +53,69 @@ class RecoveryService:
         from recovery_agent.tools.recovery_tools import register_all_recovery_tools
         register_all_recovery_tools()
 
-    def process_turn(
-        self,
-        session_id: str,
-        customer_text: str,
-        customer_id: Optional[int] = None,
-        history: Optional[list] = None,
-    ) -> dict:
+    def process_turn(self, session_id, customer_text, customer_id=None, history=None,
+                      call_session_id=None):
         """
-        Process a single customer turn end-to-end.
-        Returns:
-            {
-                "intent":        <str>,
-                "confidence":    <float>,
-                "response_text": <str>,   # What the bot should SAY
-                "tool_calls":    [list],  # Tools that were executed
-                "state":         <dict>,  # Updated state snapshot
-                "should_end_call": <bool>,
-            }
+        Full non-streaming turn used by the /api/test/process-turn/ endpoint
+        (and any future non-WS caller). The real voice path (consumers.py)
+        does NOT call this -- it streams via chat_turn_stream and lets the
+        LLM's own tool-calling loop invoke recovery tools directly. This
+        method exists for text-only testing/integration and mirrors that
+        same pipeline in a single blocking call:
+
+            1. classify intent (recovery_intent_service)
+            2. assemble verified context (get_recovery_context)
+            3. dispatch business-state side effects (handle_intent)
+            4. generate the actual reply text (cloud_llm_service.chat_turn)
         """
         history = history or []
-        from recovery_agent.services.conversation_history import (
-            get_state, set_recovery_intent, set_final_transcript, save_conversation,
-        )
-        from recovery_agent.tools.tool_registry import (
-            set_tool_session, reset_tool_session, parse_tool_call, execute_tool,
-            get_tool_prompt_block,
-        )
 
-        # 1. Update state with new transcript
-        save_conversation(session_id, "Customer", customer_text)
-        set_final_transcript(session_id, customer_text)
+        # 1. classify
+        classification = recovery_intent_service.detect_intent(customer_text, history=history)
+        intent = classification["intent"]
+        entities = classification.get("entities", {})
+        entities["confidence"] = classification.get("confidence", 0.0)
 
-        # 2. Load customer context
-        customer_context = None
+        # 2. context
+        context = None
         if customer_id:
-            from recovery_agent.services.crm_service import crm_service
-            customer_context = crm_service.get_recovery_profile(customer_id)
+            context = self.get_recovery_context(customer_id, call_session_id=call_session_id)
+        if context is None:
+            # no customer_id / no matching customer -- still let the LLM
+            # respond generically rather than hard-failing the turn.
+            context = {
+                "customer_id": customer_id,
+                "customer_name": "Customer",
+                "recovery_case_id": None,
+                "recovery_status": "no_open_case",
+                "amount_due": "0",
+                "outstanding_amount": "0",
+                "due_date": None,
+                "workflow": "revenue_recovery",
+            }
 
-        # 3. Build the LLM prompt as a mutable message list -- we keep
-        # appending to this across tool hops so each re-call to the LLM
-        # sees the full conversation, including tool results.
-        messages = self._build_prompt(
-            customer_text=customer_text,
-            customer_context=customer_context,
-            history=history,
+        # 3. dispatch business-state side effects
+        dispatch_result = self.handle_intent(
+            intent, entities, context, call_session_id=call_session_id,
         )
 
-        # 4. Get the first LLM reply.
-        response_text = self._get_llm_reply(messages, customer_text, customer_context)
+        # 4. generate the reply
+        llm_result = chat_turn(
+            session_id=session_id,
+            customer_text=customer_text,
+            context=context,
+            history=history,
+            use_rag=True,
+        )
 
-        # 5. Tool-hop loop.
-        #
-        # After a non-terminal tool executes, we append the tool call and
-        # its result to the message history and call the LLM again for a
-        # natural-language reply (standard function-calling pattern).
-        # Terminal tools (end_call, schedule_callback -- anything with
-        # ToolSpec.terminal=True) end the turn immediately using their own
-        # "message", since no further LLM turn should happen after the
-        # call is ending.
-        tool_calls_made = []
-        should_end = False
-        max_hops = 4
-        hop = 0
-        token = set_tool_session(session_id)
-        try:
-            while hop < max_hops:
-                tool_call = parse_tool_call(response_text)
-                if not tool_call:
-                    break
-                name, args = tool_call
-                if customer_id and "customer_id" not in args:
-                    args["customer_id"] = customer_id
-                logger.info(f"[RECOVERY] executing tool: {name}({args})")
-                result = execute_tool(name, args)
-                tool_calls_made.append({
-                    "tool": name,
-                    "arguments": args,
-                    "result": result,
-                })
-
-                if result.get("terminal"):
-                    should_end = True
-                    response_text = result.get("result", {}).get(
-                        "message", "Thank you. Goodbye."
-                    )
-                    break
-
-                messages.append({
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {"tool": name, "arguments": args}, ensure_ascii=False
-                    ),
-                })
-                tool_payload = result.get("result", result)
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[Tool result for {name}]: "
-                        f"{json.dumps(tool_payload, ensure_ascii=False)}\n\n"
-                        "Use this to respond naturally to the customer in "
-                        "Hindi/Hinglish, or call another tool if still "
-                        "needed. Do not mention the tool, the database, or "
-                        "that you 'checked' anything."
-                    ),
-                })
-                response_text = self._get_llm_reply(
-                    messages, customer_text, customer_context
-                )
-                hop += 1
-        finally:
-            reset_tool_session(token)
-
-        # 6. Update intent state
-        intent = "unclear"
-        confidence = 0.0
-        try:
-            classification = self.classifier.detect_intent(customer_text, history=history)
-            intent = classification["intent"]
-            confidence = classification["confidence"]
-            set_recovery_intent(session_id, intent, confidence, classification.get("entities", {}))
-        except Exception as e:
-            logger.warning(f"[RECOVERY] classification failed: {e}")
-
-        # 7. Persist bot response
-        save_conversation(session_id, "Aarohi", response_text)
-
-        # 8. Return result
         return {
             "intent": intent,
-            "confidence": confidence,
-            "response_text": response_text,
-            "tool_calls": tool_calls_made,
-            "state": get_state(session_id),
-            "should_end_call": should_end,
+            "confidence": classification.get("confidence", 0.0),
+            "entities": entities,
+            "recovery_result": dispatch_result,
+            "response_text": llm_result.get("response_text", ""),
+            "usage": llm_result.get("usage", {}),
+            "recovery_status": context.get("recovery_status"),
         }
 
     def _get_llm_reply(self, messages, customer_text, customer_context) -> str:

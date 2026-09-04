@@ -37,8 +37,9 @@ from .models import (
     Customer, CallSession, TTSVoice, LLMSetting,
     RecoveryCase, RecoveryCampaign, Callback, PaymentRecord,
 )
+from .views import invalidate_module_rules_cache
 
-logger = logging.getLogger('voice_bot')
+logger = logging.getLogger('recovery_agent')
 
 BARGE_IN_THRESHOLD_MIN_RMS = 700
 BARGE_IN_THRESHOLD_MAX_RMS = 2200
@@ -279,6 +280,7 @@ def llm_settings(request):
         questions_per_turn_max=data.get("questions_per_turn_max", 1),
     )
     setting = LLMSetting.objects.select_related("voice").get(pk=setting.pk)
+    invalidate_module_rules_cache()
     return Response({"success": True, "setting": _serialize_llm_setting(setting)}, status=201)
 
 
@@ -309,6 +311,7 @@ def llm_setting_detail(request, setting_id):
 
     setting.save()
     setting = LLMSetting.objects.select_related('voice').get(pk=setting.pk)
+    invalidate_module_rules_cache()
     return Response({"success": True, "setting": _serialize_llm_setting(setting)})
 
 

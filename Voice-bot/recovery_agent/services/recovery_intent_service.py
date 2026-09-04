@@ -111,7 +111,8 @@ RECOVERY_ACTIONS = {
 }
 
 
-# Call OUTCOME enum — what HAPPENED in this call (separate from intent). # Set post-call by recovery_service, NOT by the live classifier. CALL_OUTCOMES = [
+# Call OUTCOME enum — what HAPPENED in this call (separate from intent). # Set post-call by recovery_service, NOT by the live classifier.
+CALL_OUTCOMES = [
     "recovered",                     # payment verified + case closed
     "promise_to_pay",                # PTP recorded
     "payment_link_sent",             # link generated/sent successfully
@@ -131,7 +132,8 @@ RECOVERY_ACTIONS = {
 ]
 
 
-# Recovery STATUS — where the case IS in the recovery lifecycle. RECOVERY_STATUSES = [
+# Recovery STATUS — where the case IS in the recovery lifecycle.
+RECOVERY_STATUSES = [
     "pending",
     "in_progress",
     "payment_verified",

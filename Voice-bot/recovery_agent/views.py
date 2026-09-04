@@ -368,3 +368,70 @@ def format_slots_for_reference(date, slots):
 
 def book_slot_for_session(session_id, date, time):
     return {"success": False, "error": "not_implemented_in_recovery_agent"}
+
+# ═══════════════════════════════════════════════════════════════
+# LLMSetting -> prompt_builder bridge (persona/behaviour rows)
+# Cached in-process; invalidated on admin write (see views_admin.py).
+# ═══════════════════════════════════════════════════════════════
+
+_llmsettings_cache = None
+
+def _load_llmsettings_from_db():
+    """Returns the active LLMSetting row(s) as plain dicts for
+    prompt_builder._merge_llmsetting_fields(). Single-tenant MVP: normally
+    exactly one is_active=True row; the list shape supports future A/B rows."""
+    global _llmsettings_cache
+    if _llmsettings_cache is not None:
+        return _llmsettings_cache
+
+    from recovery_agent.models import LLMSetting
+    rows = LLMSetting.objects.filter(flag='c', is_active=True).order_by('name')
+    _llmsettings_cache = [
+        {
+            "name": s.name,
+            "persona_name": s.persona_name,
+            "opening_line": s.opening_line,
+            "system_prompt": s.system_prompt,
+            "behaviour": s.behaviour,
+        }
+        for s in rows
+    ]
+    return _llmsettings_cache
+
+
+def invalidate_module_rules_cache():
+    """Call after any LLMSetting create/update/delete so the next turn
+    picks up the change instead of serving the stale in-process cache."""
+    global _llmsettings_cache
+    _llmsettings_cache = None
+
+
+def get_active_persona_config():
+    """
+    Builds the persona_config dict consumed by prompt_builder.get_persona_instruction()
+    and build_turn_input(). Only text-prompt fields belong here -- tone/pace/voice
+    are TTS delivery settings, not prompt content, and are read separately by
+    the TTS/consumers layer via get_active_llm_setting_raw() below.
+    """
+    from recovery_agent.models import LLMSetting
+    setting = LLMSetting.objects.filter(flag='c', is_active=True).order_by('name').first()
+    if not setting:
+        return None
+    return {
+        "name": setting.persona_name,
+        "system_prompt": setting.system_prompt,
+        "behaviour": setting.behaviour,
+        "opening_line": setting.opening_line,
+    }
+
+
+def get_active_llm_setting_raw():
+    """Full active LLMSetting row for callers that need TTS/voice/timing
+    fields (consumers.py), not just prompt text."""
+    from recovery_agent.models import LLMSetting
+    return (
+        LLMSetting.objects.select_related('voice')
+        .filter(flag='c', is_active=True)
+        .order_by('name')
+        .first()
+    )

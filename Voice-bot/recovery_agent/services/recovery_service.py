@@ -24,6 +24,8 @@ from django.utils import timezone
 
 from .crm_service import crm_service
 from .payment_service import payment_service
+from .recovery_intent_service import recovery_intent_service
+from .cloud_llm_service import chat_turn
 
 logger = logging.getLogger('recovery_agent')
 
@@ -33,7 +35,59 @@ class RecoveryService:
     # ───────────────────────────────────────────────────────────
     # Context assembly — fed to the LLM as `context` in chat_turn/chat_turn_stream
     # ───────────────────────────────────────────────────────────
+    def process_turn(self, session_id, customer_text, customer_id=None, history=None,
+                      call_session_id=None):
+        """
+        Full non-streaming turn used by /api/test/process-turn/. The real
+        voice path (consumers.py) does NOT call this -- it streams via
+        chat_turn_stream and lets the LLM's tool-calling loop invoke
+        recovery tools directly. This exists for text-only testing.
+        """
+        history = history or []
 
+        classification = recovery_intent_service.detect_intent(customer_text, history=history)
+        intent = classification["intent"]
+        entities = classification.get("entities", {})
+        entities["confidence"] = classification.get("confidence", 0.0)
+
+        context = None
+        if customer_id:
+            context = self.get_recovery_context(customer_id, call_session_id=call_session_id)
+        if context is None:
+            context = {
+                "customer_id": customer_id,
+                "customer_name": "Customer",
+                "recovery_case_id": None,
+                "recovery_status": "no_open_case",
+                "amount_due": "0",
+                "outstanding_amount": "0",
+                "due_date": None,
+                "workflow": "revenue_recovery",
+            }
+
+        dispatch_result = self.handle_intent(
+            intent, entities, context, call_session_id=call_session_id,
+        )
+
+        llm_result = chat_turn(
+            session_id=session_id,
+            customer_text=customer_text,
+            context=context,
+            history=history,
+            use_rag=True,
+        )
+
+        return {
+            "intent": intent,
+            "confidence": classification.get("confidence", 0.0),
+            "entities": entities,
+            "recovery_result": dispatch_result,
+            "response_text": llm_result.get("response_text", ""),
+            "usage": llm_result.get("usage", {}),
+            "recovery_status": context.get("recovery_status"),
+        }
+    
+    
     def get_recovery_context(self, customer_id, call_session_id=None):
         profile = crm_service.get_recovery_profile(customer_id)
         if profile is None:

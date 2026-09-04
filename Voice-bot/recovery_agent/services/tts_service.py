@@ -4,7 +4,7 @@ import base64
 import logging
 from django.conf import settings
 from murf import Murf, MurfRegion
-logger = logging.getLogger('voice_bot')
+logger = logging.getLogger('recovery_agent')
 
 
 class BaseTTS:
@@ -309,23 +309,17 @@ class TTSServiceFactory:
         return self._instances[provider_name]
     
     def _get_defaults(self):
-        """Direct model se fetch.
-
-        🔥 AISettings merge ho gaya Dealer me -- ab provider Dealer.tts_provider
-        se aata hai. Dealer me tts_voice field abhi nahi hai (AISettings->Dealer
-        merge ke time drop ho gaya) -- isliye voice hardcoded default hi rehta
-        hai jab tak wo field wapas nahi aata ya kisi aur source (jaise
-        LLMSetting.voice, jo already per-segment TTS voice track karta hai)
-        se nahi liya jaata.
-        """
-        from voice_bot.models import Dealer
+        """Fallback provider/voice when caller doesn't pass explicit values.
+        Reads the active LLMSetting.voice row (recovery_agent's real model)
+        instead of the old Honda Dealer.tts_provider, which doesn't exist."""
+        from recovery_agent.models import LLMSetting
 
         try:
-            dealer = Dealer.objects.first()
-            if dealer:
-                return dealer.tts_provider, "hi-IN-sunaina"
+            setting = LLMSetting.objects.filter(flag='c', is_active=True).select_related('voice').first()
+            if setting and setting.voice:
+                return "murf", setting.voice.provider_voice_id or "hi-IN-sunaina"
         except Exception as e:
-            logger.warning(f"Dealer fetch failed: {e}")
+            logger.warning(f"LLMSetting fetch failed: {e}")
 
         return "murf", "hi-IN-sunaina"
     
