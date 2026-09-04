@@ -1,20 +1,82 @@
 import json
-import redis
-from django.conf import settings
+from typing import Any
 
-_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-
-
-def get_turns(call_sid: str) -> list:
-    raw = _client.get(f"call:{call_sid}:turns")
-    return json.loads(raw) if raw else []
+from recovery_agent.utils.redis_client import redis_client
 
 
-def append_turn(call_sid: str, role: str, text: str) -> None:
-    turns = get_turns(call_sid)
-    turns.append({"role": role, "text": text})
-    _client.set(f"call:{call_sid}:turns", json.dumps(turns))
+def get_turns(call_id: str) -> list[dict[str, str]]:
+    """
+    Return all conversation turns for a call.
+
+    Redis key:
+        call:{call_id}:turns
+    """
+
+    if redis_client is None:
+        return []
+
+    raw = redis_client.get(
+        f"call:{call_id}:turns"
+    )
+
+    if not raw:
+        return []
+
+    try:
+        data: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    return [
+        item
+        for item in data
+        if isinstance(item, dict)
+        and isinstance(item.get("role"), str)
+        and isinstance(item.get("text"), str)
+    ]
 
 
-def clear_turns(call_sid: str) -> None:
-    _client.delete(f"call:{call_sid}:turns")
+def append_turn(
+    call_id: str,
+    role: str,
+    text: str,
+) -> None:
+    """
+    Append a conversation turn to Redis.
+    """
+
+    if redis_client is None:
+        return
+
+    turns = get_turns(call_id)
+
+    turns.append(
+        {
+            "role": role,
+            "text": text,
+        }
+    )
+
+    redis_client.set(
+        f"call:{call_id}:turns",
+        json.dumps(
+            turns,
+            ensure_ascii=False,
+        ),
+    )
+
+
+def clear_turns(call_id: str) -> None:
+    """
+    Delete all conversation turns for a call.
+    """
+
+    if redis_client is None:
+        return
+
+    redis_client.delete(
+        f"call:{call_id}:turns"
+    )
