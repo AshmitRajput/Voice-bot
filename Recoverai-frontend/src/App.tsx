@@ -11,6 +11,10 @@ import NewCampaign from "@/pages/NewCampaign";
 import CampaignDetails from "@/pages/CampaignDetails";
 import RecoveryCases from "@/pages/RecoveryCases";
 import Callbacks from "@/pages/Callbacks";
+import CallRecordings from "@/pages/CallRecordings";
+import CallDetail from "@/pages/CallDetail";
+import Personas from "@/pages/Personas";
+import Voices from "@/pages/Voices";
 
 export default function App() {
   return (
@@ -34,11 +38,15 @@ export default function App() {
 
             <Route path="/recovery-cases" element={<RecoveryCases />} />
             <Route path="/callbacks" element={<Callbacks />} />
-            <Route path="/recordings" element={<ComingSoon title="Call Recordings" phase="Phase 6" />} />
-            <Route path="/recordings/:sessionId" element={<ComingSoon title="Call detail" phase="Phase 6" />} />
+
+            <Route path="/recordings" element={<CallRecordings />} />
+            <Route path="/recordings/:sessionId" element={<CallDetail />} />
+
+            {/* Phase 7 */}
+            <Route path="/personas" element={<Personas />} />
+            <Route path="/voices" element={<Voices />} />
+
             <Route path="/voice-test" element={<ComingSoon title="AI Voice Test" phase="already shipped" />} />
-            <Route path="/personas" element={<ComingSoon title="Personas" phase="Phase 7" />} />
-            <Route path="/voices" element={<ComingSoon title="Voices" phase="Phase 7" />} />
             <Route path="/knowledge" element={<ComingSoon title="Knowledge Base" phase="Phase 8" />} />
             <Route path="/settings" element={<ComingSoon title="Settings" phase="Phase 9" />} />
             <Route path="/" element={<Navigate to="/dashboard" replace />} />

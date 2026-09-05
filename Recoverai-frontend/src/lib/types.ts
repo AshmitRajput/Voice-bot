@@ -150,3 +150,159 @@ export interface CallbacksResponse {
   callbacks: Callback[];
 }
 
+
+export interface CustomerBrief {
+  id: number;
+  name: string;
+  phone_number: string;
+}
+
+export interface LLMSettingBrief {
+  id: number;
+  persona_name: string;
+  name: string;
+}
+
+export interface Recording {
+  id: number;
+  session_id: string;
+  customer: CustomerBrief | null;
+  campaign_id: number | null;
+  agent: LLMSettingBrief | null;
+  status: string; // queued/ringing/ongoing/completed/failed/busy/no_answer/dropped
+  intent: string;
+  recovery_outcome: string;
+  direction: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number | null;
+  // transcript/intent_history are raw JSON blobs on the model — shape
+  // isn't pinned down anywhere in views_admin.py, so treat as opaque.
+  // call_detail_admin's `turns` array is the structured version; prefer
+  // that for rendering anything, don't parse these two.
+  transcript: unknown;
+  intent_history: unknown;
+  call_summary: string | null;
+  recording_stereo: string | null;
+  recording_mixed: string | null;
+}
+
+export type RecordingsResponse = PaginatedResponse<Recording>;
+
+// Matches call_detail_admin's turns[] dicts exactly (views_admin.py L545-554).
+export interface CallTurn {
+  id: number;
+  speaker: string;
+  text: string;
+  intent: string | null;
+  confidence: number | null;
+  at: string | null;
+}
+
+// Matches call_detail_admin's "call" object exactly (views_admin.py L527-556).
+// Note: this is a DIFFERENT shape from Recording above — no `id`, no
+// `recording_stereo`, and it has pricing fields + turns[] that the list
+// endpoint doesn't return. Don't assume these are interchangeable.
+export interface CallDetail {
+  session_id: string;
+  customer: CustomerBrief | null;
+  status: string;
+  intent: string;
+  recovery_outcome: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number | null;
+  transcript: unknown;
+  intent_history: unknown;
+  call_summary: string | null;
+  recording_mixed: string | null;
+  stt_pricing: string;
+  tts_pricing: string;
+  llm_pricing: string;
+  dialer_pricing: string;
+  total_cost: string;
+  turns: CallTurn[];
+}
+
+export interface CallDetailResponse {
+  success: boolean;
+  call: CallDetail;
+}
+
+// ── TTS Voices (Phase 7) ─────────────────────────────────────────
+// Matches _serialize_tts_voice exactly (views_admin.py L54-68).
+export interface TTSVoice {
+  id: number;
+  voice_name: string;
+  gender: string;
+  provider_voice_id: string;
+  provider_name: string;
+  language: string;
+  is_active: boolean;
+  sample_url: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TTSVoicesResponse {
+  success: boolean;
+  count: number;
+  voices: TTSVoice[];
+}
+
+export interface TTSVoiceResponse {
+  success: boolean;
+  voice: TTSVoice;
+}
+
+// ── LLM Settings / Personas (Phase 7) ─────────────────────────────
+// Matches _serialize_llm_setting exactly (views_admin.py L71-97).
+// Note `voice` is the full nested TTSVoice object on read — but writes go
+// through `voice_id` (see llm_settings POST / llm_setting_detail PATCH).
+// Two different shapes for the same relationship, read vs write.
+export interface LLMSetting {
+  id: number;
+  name: string;
+  is_active: boolean;
+  provider: string;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  persona_name: string;
+  opening_line: string;
+  system_prompt: string;
+  behaviour: string;
+  voice: TTSVoice | null;
+  tone: number;
+  pace: number;
+  barge_in_threshold: number;
+  max_turns: number;
+  allow_customer_barge_in: boolean;
+  language: string;
+  response_max_chars: number;
+  questions_per_turn_max: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface LLMSettingsResponse {
+  success: boolean;
+  count: number;
+  settings: LLMSetting[];
+}
+
+export interface LLMSettingResponse {
+  success: boolean;
+  setting: LLMSetting;
+}
+
+/** Body shape for POST/PATCH /api/admin/llm-settings/ — voice_id, not voice. */
+export type LLMSettingWritePayload = Partial<
+  Omit<LLMSetting, "id" | "voice" | "created_at" | "updated_at">
+> & { voice_id?: number };
+
+/** Body shape for POST/PATCH /api/admin/tts-voices/. */
+export type TTSVoiceWritePayload = Partial<
+  Omit<TTSVoice, "id" | "created_at" | "updated_at">
+>;
+
