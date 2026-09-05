@@ -306,3 +306,74 @@ export type TTSVoiceWritePayload = Partial<
   Omit<TTSVoice, "id" | "created_at" | "updated_at">
 >;
 
+
+export const KB_CATEGORIES = [
+  "payment_policy",
+  "payment_methods",
+  "payment_link",
+  "late_payment",
+  "promise_to_pay",
+  "hardship",
+  "dispute",
+  "complaint",
+  "callback",
+  "escalation",
+  "communication_policy",
+] as const;
+
+export type KbCategory = (typeof KB_CATEGORIES)[number];
+
+// Matches kb_documents' list-row shape exactly.
+export interface KnowledgeDocument {
+  id: number;
+  doc_id: string;
+  title: string;
+  category: string;
+  status: string; // "pending" | "indexed" | "stale" | ... — set by rag_service, exact choices not confirmed
+  chunk_count: number;
+  collection_name: string;
+  source: string;
+  metadata: Record<string, unknown>;
+  indexed_at: string | null;
+}
+
+export interface KnowledgeDocumentsResponse {
+  success: boolean;
+  documents: KnowledgeDocument[];
+  total_count: number;
+}
+
+// Matches kb_document_detail — same as KnowledgeDocument plus full content.
+export interface KnowledgeDocumentDetail extends KnowledgeDocument {
+  content: string;
+}
+
+export interface KnowledgeDocumentDetailResponse {
+  success: boolean;
+  document: KnowledgeDocumentDetail;
+}
+
+export interface KnowledgeStatsResponse {
+  success: boolean;
+  total_documents: number;
+  by_category: Record<string, number>;
+  embedding_model: string;
+}
+
+export interface KbStorePayload {
+  doc_id?: string;
+  title: string;
+  category: KbCategory | string;
+  content: string;
+  source?: string;
+}
+
+export interface CallSettings {
+  call_timeout: number;
+  max_call_duration: number;
+}
+
+export interface CallSettingsResponse {
+  success: boolean;
+  settings: CallSettings;
+}

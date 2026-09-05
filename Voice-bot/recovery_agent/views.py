@@ -9,6 +9,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.utils import timezone
+from django.conf import settings
 
 logger = logging.getLogger('recovery_agent')
 
@@ -435,3 +436,101 @@ def get_active_llm_setting_raw():
         .order_by('name')
         .first()
     )
+
+def set_dialer_call_id(session_id, dialer_call_id):
+    """Persist Plivo's streamId/call_uuid onto the CallSession row."""
+    from recovery_agent.models import CallSession
+    sess = CallSession.objects.filter(session_id=session_id).first()
+    if not sess:
+        logger.warning(f"[DIALER] no CallSession for session_id={session_id}, cannot set dialer_call_id")
+        return None
+    sess.dialer_call_id = dialer_call_id
+    sess.save(update_fields=["dialer_call_id", "updated_at"])
+    return sess
+
+# ═══════════════════════════════════════════════════════════════
+# Voice Test (demo) — persona-by-id lookups
+# Same shape as get_active_persona_config / get_active_llm_setting_raw
+# above, but for a SPECIFIC LLMSetting id rather than whichever row has
+# is_active=True. Used only by the Voice Test admin page (consumers.py's
+# demo_mode branch) so admins can preview any persona, not just the live
+# one, without touching is_active.
+# ═══════════════════════════════════════════════════════════════
+
+def get_persona_config_by_id(persona_id):
+    from recovery_agent.models import LLMSetting
+    setting = LLMSetting.objects.filter(flag='c', id=persona_id).first()
+    if not setting:
+        return None
+    return {
+        "name": setting.persona_name,
+        "system_prompt": setting.system_prompt,
+        "behaviour": setting.behaviour,
+        "opening_line": setting.opening_line,
+    }
+
+
+def get_llm_setting_raw_by_id(persona_id):
+    from recovery_agent.models import LLMSetting
+    return (
+        LLMSetting.objects.select_related('voice')
+        .filter(flag='c', id=persona_id)
+        .first()
+    )
+
+def plivo_answer(request):
+    """GET /api/voice/plivo/answer/?session_id=...&phone=...
+    Plivo hits this the instant the call is answered. Returns XML that
+    tells Plivo to open a bidirectional audio stream to our WebSocket."""
+    from django.http import HttpResponse
+    session_id = request.GET.get("session_id", "")
+    phone = request.GET.get("phone", "")
+    base = settings.PUBLIC_BASE_URL.rstrip('/')
+    ws_scheme = "wss" if base.startswith("https") else "ws"
+    ws_host = base.split("://", 1)[1]
+    stream_url = f"{ws_scheme}://{ws_host}/api/voice/ws/plivo/{session_id}/{phone}/"
+
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream bidirectional="true" audioTrack="both" streamTimeout="120"
+            keepCallAlive="true" contentType="audio/x-l16;rate=8000">
+        {stream_url}
+    </Stream>
+</Response>'''
+    return HttpResponse(xml, content_type="text/xml")
+
+
+def plivo_hangup(request):
+    """GET /api/voice/plivo/hangup/?session_id=... -- Plivo notifies here
+    when the call ends from their side (busy/no-answer/failed/completed).
+    The WebSocket disconnect() already handles normal call-ended cleanup;
+    this only matters for calls that never even connected to the stream."""
+    from django.http import HttpResponse, JsonResponse
+    from recovery_agent.models import CallSession
+    session_id = request.GET.get("session_id")
+    hangup_cause = request.GET.get("HangupCause", "")
+    if session_id:
+        sess = CallSession.objects.filter(session_id=session_id).first()
+        if sess and sess.status not in ("completed", "failed"):
+            sess.status = "failed" if hangup_cause and hangup_cause != "NORMAL_CLEARING" else "no_answer"
+            sess.save(update_fields=["status", "updated_at"])
+    return JsonResponse({"ok": True})
+
+@csrf_exempt
+def trigger_call(request):
+    """POST /api/admin/calls/trigger/  body: {"customer_id": 123}
+    Wired to the dashboard's "Call" button."""
+    from django.http import JsonResponse
+    import json as _json
+    from .services.plivo_service import initiate_outbound_call
+    try:
+        body = _json.loads(request.body or "{}")
+        customer_id = body.get("customer_id")
+        if not customer_id:
+            return JsonResponse({"success": False, "error": "customer_id required"}, status=400)
+        result = initiate_outbound_call(customer_id)
+        return JsonResponse(result, status=200 if result["success"] else 400)
+    except Exception as e:
+        logger.exception("trigger_call failed")
+        return JsonResponse({"success": False, "error": str(e)}, status=500)
+    

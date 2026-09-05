@@ -2,7 +2,6 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import { RequireAuth } from "@/components/layout/RequireAuth";
 import Login from "@/pages/auth/Login";
-import ComingSoon from "@/pages/ComingSoon";
 import Dashboard from "@/pages/Dashboard";
 import Customers from "@/pages/Customers";
 import CustomerDetails from "@/pages/CustomerDetails";
@@ -15,6 +14,9 @@ import CallRecordings from "@/pages/CallRecordings";
 import CallDetail from "@/pages/CallDetail";
 import Personas from "@/pages/Personas";
 import Voices from "@/pages/Voices";
+import VoiceTest from "@/pages/VoiceTest";
+import KnowledgeBase from "@/pages/KnowledgeBase";
+import Settings from "@/pages/Settings";
 
 export default function App() {
   return (
@@ -25,6 +27,7 @@ export default function App() {
 
           <Route element={<RequireAuth />}>
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/voice-test" element={<VoiceTest />} />
 
             <Route path="/customers" element={<Customers />} />
             <Route path="/customers/:id" element={<CustomerDetails />} />
@@ -42,13 +45,12 @@ export default function App() {
             <Route path="/recordings" element={<CallRecordings />} />
             <Route path="/recordings/:sessionId" element={<CallDetail />} />
 
-            {/* Phase 7 */}
             <Route path="/personas" element={<Personas />} />
             <Route path="/voices" element={<Voices />} />
 
-            <Route path="/voice-test" element={<ComingSoon title="AI Voice Test" phase="already shipped" />} />
-            <Route path="/knowledge" element={<ComingSoon title="Knowledge Base" phase="Phase 8" />} />
-            <Route path="/settings" element={<ComingSoon title="Settings" phase="Phase 9" />} />
+            <Route path="/knowledge" element={<KnowledgeBase />} />
+            <Route path="/settings" element={<Settings />} />
+
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
           </Route>
 

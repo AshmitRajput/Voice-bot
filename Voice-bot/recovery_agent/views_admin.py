@@ -38,6 +38,7 @@ from .models import (
     RecoveryCase, RecoveryCampaign, Callback, PaymentRecord,
 )
 from .views import invalidate_module_rules_cache
+from .services.call_settings_service import get_call_settings, set_call_settings
 
 logger = logging.getLogger('recovery_agent')
 
@@ -796,3 +797,30 @@ def admin_test_tts(request):
 def get_voice_options(request):
     """GET /api/admin/voice-options/ — available TTS provider/voice matrix"""
     return Response(settings.TTS_PROVIDERS)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Admin: call settings (timeout / max duration) — Phase 9
+# ═══════════════════════════════════════════════════════════════
+
+@api_view(['GET', 'PATCH'])
+def call_settings(request):
+    """
+    GET  /api/admin/call-settings/  -> {"success": true, "settings": {...}}
+    PATCH /api/admin/call-settings/ Body: {"call_timeout": 30, "max_call_duration": 600}
+    Either field is optional on PATCH — only what's sent gets updated.
+    """
+    from .services.call_settings_service import get_call_settings, set_call_settings
+
+    if request.method == 'GET':
+        return Response({"success": True, "settings": get_call_settings()})
+
+    data = request.data
+    try:
+        updated = set_call_settings(
+            call_timeout=data.get("call_timeout"),
+            max_call_duration=data.get("max_call_duration"),
+        )
+        return Response({"success": True, "settings": updated})
+    except Exception as e:
+        return Response({"success": False, "error": str(e)}, status=500)

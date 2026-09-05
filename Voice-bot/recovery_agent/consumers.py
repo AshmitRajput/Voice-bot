@@ -58,6 +58,7 @@ from .views import (
     get_random_customer_context, save_turn, end_call_session, finalize_call_summary,
     get_history_for_llm, save_turn_scores, log_service_error,
     get_active_persona_config, get_active_llm_setting_raw,
+    get_persona_config_by_id, get_llm_setting_raw_by_id,
 )
 from .views_admin import _get_barge_in_settings_sync, _resolve_customer_sync, _persist_recording_paths_sync
 from .tools.tool_registry import (
@@ -221,6 +222,8 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
 
         query_params = parse_qs((self.scope.get("query_string") or b"").decode())
         self.phone_number = (query_params.get("phone") or [None])[0]
+        persona_id_param = (query_params.get("persona_id") or [None])[0]
+        self._demo_mode = (query_params.get("demo") or [None])[0] in ("1", "true", "True")
 
         self.session = {
             "history": [],
@@ -265,29 +268,55 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
 
         asyncio.create_task(database_sync_to_async(init_state)(self.session_id))
 
-        # ── Persona: load once per call, from the active LLMSetting row.
-        # Falls back to None -> client.py/prompt_builder.py's built-in
-        # Riya default if no admin row is configured yet.
-        llm_setting = await database_sync_to_async(get_active_llm_setting_raw)()
-        self.persona_config = await database_sync_to_async(get_active_persona_config)()
+        # ── Persona: demo mode loads a SPECIFIC persona by id (so admins
+        # can preview any persona, not just whichever is is_active=True).
+        # Real calls (phone-number flow) keep the original active-persona
+        # lookup, unchanged.
+        if self._demo_mode and persona_id_param:
+            llm_setting = await database_sync_to_async(get_llm_setting_raw_by_id)(int(persona_id_param))
+            self.persona_config = await database_sync_to_async(get_persona_config_by_id)(int(persona_id_param))
+        else:
+            llm_setting = await database_sync_to_async(get_active_llm_setting_raw)()
+            self.persona_config = await database_sync_to_async(get_active_persona_config)()
         self.persona_name = (self.persona_config or {}).get("name") or "Riya"
         self._tts_voice_name = (
             getattr(llm_setting.voice, "provider_voice_id", None)
             if llm_setting and llm_setting.voice else None
         ) or "hi-IN-sunaina"
-        self._tts_provider = getattr(llm_setting, "provider", None) if llm_setting else None
+        self._tts_provider = "murf" 
 
         # ── Customer / recovery-case context
-        if self.phone_number:
-            context = await database_sync_to_async(get_customer_context_by_phone)(self.phone_number)
-            if context is None:
-                logger.warning(
-                    f"[WS] no Customer found for phone={self.phone_number} -- "
-                    f"falling back to a random seeded customer's context for this demo call."
-                )
-                context = await database_sync_to_async(get_random_customer_context)()
+        # Demo mode NEVER touches a real Customer/RecoveryCase row: no
+        # lookup, no random-customer fallback, no _resolve_customer_sync
+        # call, and (see _ensure_call_session below) no CallSession row is
+        # ever created for this session_id either. Every recovery tool
+        # (get_recovery_context/update_recovery_case/create_payment_link/
+        # schedule_callback/end_call's record_call_completion) resolves its
+        # target via that CallSession row first -- with none existing, they
+        # all hit their existing "no_active_recovery_case" / "customer not
+        # found" fail-soft branches and write nothing. Confirmed by reading
+        # recovery_tools.py, callback_tools.py and callback_service.py directly.
+        if self._demo_mode:
+            context = {
+                "customer_id": None,
+                "customer_name": "Test Customer",
+                "amount_due": "0",
+                "due_date": None,
+                "recovery_status": "no_open_case",
+                "phone_number": None,
+            }
+            self.customer = None
         else:
-            context = await database_sync_to_async(get_random_customer_context)()
+            if self.phone_number:
+                context = await database_sync_to_async(get_customer_context_by_phone)(self.phone_number)
+                if context is None:
+                    logger.warning(
+                        f"[WS] no Customer found for phone={self.phone_number} -- "
+                        f"falling back to a random seeded customer's context for this demo call."
+                    )
+                    context = await database_sync_to_async(get_random_customer_context)()
+            else:
+                context = await database_sync_to_async(get_random_customer_context)()
 
         self.customer_id = context.get("customer_id")
         effective_phone = context.get("phone_number") or self.phone_number
@@ -297,16 +326,19 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
         self._call_session_lock = asyncio.Lock()
         self._call_session_task = None
 
-        self.customer = await database_sync_to_async(_resolve_customer_sync)(
-            phone_number=effective_phone, customer_id=self.customer_id,
-        )
+        if not self._demo_mode:
+            self.customer = await database_sync_to_async(_resolve_customer_sync)(
+                phone_number=effective_phone, customer_id=self.customer_id,
+            )
 
-        # call_attempt_number / promise_broken: how many prior calls this
-        # customer has had, and whether an existing promise_date has passed
-        # without being paid. Cheap to compute here, read once per call.
-        call_attempt_number, promise_broken = await database_sync_to_async(
-            self._resolve_escalation_state
-        )(self.customer_id)
+        # call_attempt_number / promise_broken: skipped entirely in demo
+        # mode -- there is no customer_id to look anything up against.
+        if self._demo_mode:
+            call_attempt_number, promise_broken = 1, False
+        else:
+            call_attempt_number, promise_broken = await database_sync_to_async(
+                self._resolve_escalation_state
+            )(self.customer_id)
 
         self.session["cloud_context"] = {
             "customer_id": self.customer_id,
@@ -320,6 +352,7 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
             "workflow": "revenue_recovery",
             "persona_config": self.persona_config,
             "current_datetime_ist": _now_ist().strftime("%Y-%m-%d %H:%M"),
+            "demo_mode": self._demo_mode,
         }
 
         set_call_context(
@@ -371,7 +404,7 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
         print(f"🔌 [WS] Disconnected: {close_code}")
         unregister_end_call_handler(self.session_id)
         clear_call_context(self.session_id)
-        if self.session.get("has_conversation") and self.recording.get("active"):
+        if self.session.get("has_conversation") and self.recording.get("active") and not self._demo_mode:
             try:
                 if getattr(self, "_call_session_task", None):
                     await self._call_session_task
@@ -424,7 +457,7 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
         return task
 
     async def _ensure_call_session(self):
-        if self._call_session_created:
+        if self._demo_mode or self._call_session_created:
             return
         async with self._call_session_lock:
             if self._call_session_created:
@@ -1546,4 +1579,3 @@ class VoiceChatConsumer(AsyncWebsocketConsumer):
                 os.remove(p)
 
         return stereo_mp3
-    

@@ -235,6 +235,30 @@ for _d in (CALL_RECORDINGS_DIR, SIP_TTS_AUDIO_DIR):
 CALL_TIMEOUT = 30
 MAX_CALL_DURATION = 600
 
+TTS_PROVIDERS = {
+    "murf": {
+        "label": "Murf",
+        "voices": [
+            {"voice_id": "hi-IN-sunaina", "label": "Sunaina (Hindi, Female)", "gender": "female", "language": "hi-IN"},
+            {"voice_id": "hi-IN-kabir", "label": "Kabir (Hindi, Male)", "gender": "male", "language": "hi-IN"},
+            {"voice_id": "en-IN-priya", "label": "Priya (English-India, Female)", "gender": "female", "language": "en-IN"},
+        ],
+    },
+    "google": {
+        "label": "Google Cloud TTS",
+        "voices": [
+            {"voice_id": "hi-IN-Wavenet-A", "label": "Wavenet A (Hindi, Female)", "gender": "female", "language": "hi-IN"},
+        ],
+    },
+    "sarvam": {
+        "label": "Sarvam AI",
+        "voices": [
+            {"voice_id": "priya", "label": "Priya (Hindi)", "gender": "female", "language": "hi-IN"},
+        ],
+    },
+}
+ 
+
 # Logging
 LOGGING = {
     "version": 1,
