@@ -1,12 +1,20 @@
 """
-URL routing for the recovery_agent app (local testing). """
+URL routing for the recovery_agent app (local testing + auth).
+"""
 
 from django.urls import path
 from recovery_agent import views
+from recovery_agent import views_auth
 
 urlpatterns = [
     # Health check
     path('health/', views.health_check, name='health'),
+
+    # Auth (session-cookie based — single admin user)
+    path('auth/csrf/', views_auth.auth_csrf, name='auth_csrf'),
+    path('auth/login/', views_auth.auth_login, name='auth_login'),
+    path('auth/logout/', views_auth.auth_logout, name='auth_logout'),
+    path('auth/me/', views_auth.auth_me, name='auth_me'),
 
     # Test endpoints
     path('test/process-turn/', views.test_process_turn, name='test_process_turn'),
