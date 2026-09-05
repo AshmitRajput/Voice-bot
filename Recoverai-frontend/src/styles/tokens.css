@@ -1,0 +1,59 @@
+/*
+  RecoverAI design tokens.
+
+  Palette: near-black slate (not pure black), one accent — a muted gold,
+  chosen because this is a payment-recovery tool and gold reads as
+  "recovered value" without leaning on green ($$-cliché) or the generic
+  terracotta/acid-green AI-dashboard defaults.
+
+  Two type roles, not two typefaces: the system sans for UI copy and
+  navigation, and a monospace stack ONLY for things that are actually
+  data — amounts, phone numbers, session/case IDs, timestamps. That's a
+  real financial/ops convention (ledgers, terminals), not decoration.
+*/
+
+:root {
+  --bg: #14171b;
+  --surface: #1c2126;
+  --surface-raised: #232a31;
+  --border: #2a3038;
+  --text: #e7e9ec;
+  --text-dim: #9aa3ad;
+  --text-faint: #626b74;
+
+  --accent: #c9a227;
+  --accent-dim: #8f7419;
+  --accent-soft: #c9a22722;
+
+  --danger: #c15b4a;
+  --danger-soft: #c15b4a1a;
+  --success: #5a9c6e;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-data: "SF Mono", "Cascadia Code", Consolas, "Liberation Mono", monospace;
+
+  --radius: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a {
+  color: inherit;
+}

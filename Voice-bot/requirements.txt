@@ -1,10 +1,15 @@
 audioop_lts==0.2.2
 certifi==2026.7.22
 channels==4.3.2
+channels_redis==4.3.0
 chromadb==1.5.9
+daphne==4.2.3
 Django==6.1
+django-cors-headers==4.7.0
 djangorestframework==3.17.1
 greenswitch==0.0.19
+h2==4.3.0
+hf_xet==1.2.0
 httpx==0.28.1
 huggingface_hub==0.36.2
 joblib==1.5.3
@@ -20,6 +25,7 @@ plivo==4.62.0
 protobuf==7.36.0
 pydantic==2.13.5
 pydub==0.25.1
+python-dotenv==1.1.0
 redis==8.1.0
 Requests==2.34.2
 scikit_learn==1.9.0
